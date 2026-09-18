@@ -69,3 +69,17 @@ function escapeHtml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+
+// Log-level classification for row coloring.
+const LEVEL_RE = /\b(FATAL|SEVERE|ERROR|WARN(?:ING)?|INFO|DEBUG|TRACE)\b/;
+
+export function classifyLevel(text: string): string {
+  const m = LEVEL_RE.exec(text.length > 100 ? text.slice(0, 100) : text);
+  if (!m) return "";
+  const w = m[1];
+  if (w === "ERROR" || w === "FATAL" || w === "SEVERE") return "level-error";
+  if (w === "WARN" || w === "WARNING") return "level-warn";
+  if (w === "DEBUG") return "level-debug";
+  if (w === "TRACE") return "level-trace";
+  return "";
+}

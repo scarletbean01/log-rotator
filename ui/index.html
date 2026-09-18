@@ -14,14 +14,21 @@
       </aside>
       <div id="main">
         <div id="toolbar">
-          <input id="query" placeholder="search… (Enter to run, Esc to cancel)" autocomplete="off" />
+          <input id="query" placeholder="search… (Enter to run, Esc to cancel)" autocomplete="off" aria-label="Search query" />
+          <button id="search-btn" title="Search (Enter)">🔍</button>
           <label class="check"><input type="checkbox" id="regex" /> regex</label>
-          <select id="direction">
+          <select id="direction" aria-label="Search direction">
             <option value="reverse">newest first</option>
             <option value="forward">oldest first</option>
           </select>
           <label class="check"><input type="checkbox" id="follow" /> follow</label>
-          <span id="status"></span>
+          <span id="match-nav">
+            <button id="prev-match" title="Previous match (Shift+F3)">▲</button>
+            <span id="match-pos"></span>
+            <button id="next-match" title="Next match (F3)">▼</button>
+          </span>
+          <button id="clear-search" title="Return to log view">✕ clear</button>
+          <span id="status" role="status" aria-live="polite"></span>
         </div>
         <div id="viewport">
           <div id="sizer"><div id="content"></div></div>

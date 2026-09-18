@@ -126,6 +126,62 @@ mark {
 
 .regex-error { color: #ff7b7b; }
 
+/* Log level row colors */
+.row.level-error { color: #ff7b7b; }
+.row.level-warn  { color: #ffb454; }
+.row.level-debug { color: var(--muted); }
+.row.level-trace { color: var(--muted); opacity: 0.7; }
+
+/* File metadata in sidebar */
+.file-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+
+.file-live > div:first-child::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4ade80;
+  margin-left: 6px;
+  vertical-align: middle;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Toolbar buttons */
+#toolbar button {
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#toolbar button:hover { color: var(--fg); border-color: var(--accent); }
+
+/* Match navigation */
+#match-nav {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+#match-nav button { padding: 2px 6px; font-size: 11px; }
+
+/* Clear search button */
+#clear-search { display: none; }
+
 #rail {
   background: var(--panel);
   border-left: 1px solid var(--border);

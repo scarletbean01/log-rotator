@@ -11,7 +11,8 @@ export interface LineSource {
   get(index: number): LineData;
 }
 
-export type RowRenderer = (text: string) => string;
+export type RenderResult = { html: string; className?: string };
+export type RowRenderer = (text: string) => string | RenderResult;
 
 export class VirtualScroller {
   private viewport: HTMLElement;
@@ -85,10 +86,16 @@ export class VirtualScroller {
     for (let i = start; i < end; i++) {
       const d = this.source.get(i);
       const row = document.createElement("div");
-      row.className = "row";
       row.style.height = `${this.lineHeight}px`;
       row.dataset.offset = String(d.offset);
-      row.innerHTML = this.renderRow(d.text);
+      const result = this.renderRow(d.text);
+      if (typeof result === "string") {
+        row.className = "row";
+        row.innerHTML = result;
+      } else {
+        row.className = result.className ? `row ${result.className}` : "row";
+        row.innerHTML = result.html;
+      }
       frag.appendChild(row);
     }
 

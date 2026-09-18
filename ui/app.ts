@@ -1,5 +1,5 @@
 import { VirtualScroller, LineSource, LineData } from "./virtual-scroll";
-import { highlight } from "./highlight";
+import { highlight, classifyLevel } from "./highlight";
 
 // ---- token handling --------------------------------------------------------
 // The token lives in sessionStorage; fetches send it as a header, SSE URLs
@@ -25,6 +25,24 @@ async function apiFetch(path: string, retried = false): Promise<Response> {
 function sseUrl(path: string): string {
   const t = getToken();
   return t ? `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(t)}` : path;
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+function humanSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+  return `${(bytes / 1073741824).toFixed(1)} GB`;
+}
+
+function relativeTime(unix: number): string {
+  const delta = Math.floor(Date.now() / 1000) - unix;
+  if (delta < 5) return "just now";
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
+  return `${Math.floor(delta / 86400)}d ago`;
 }
 
 // ---- line buffer -----------------------------------------------------------
@@ -59,6 +77,12 @@ const followEl = document.getElementById("follow") as HTMLInputElement;
 const statusEl = document.getElementById("status") as HTMLSpanElement;
 const viewportEl = document.getElementById("viewport") as HTMLElement;
 const railEl = document.getElementById("rail") as HTMLElement;
+const searchBtnEl = document.getElementById("search-btn") as HTMLButtonElement;
+const matchNavEl = document.getElementById("match-nav") as HTMLElement;
+const matchPosEl = document.getElementById("match-pos") as HTMLSpanElement;
+const prevMatchEl = document.getElementById("prev-match") as HTMLButtonElement;
+const nextMatchEl = document.getElementById("next-match") as HTMLButtonElement;
+const clearSearchEl = document.getElementById("clear-search") as HTMLButtonElement;
 
 // ---- state -----------------------------------------------------------------
 
@@ -69,10 +93,14 @@ let isRegex = false;
 let activeSource: EventSource | null = null;
 let buffer = new LineBuffer();
 let matches: { offset: number; lineIndex: number }[] = [];
+let currentMatchIndex = -1;
+let grepMode = false;
 
-const scroller = new VirtualScroller(viewportEl, buffer, (text) =>
-  highlight(text, query, isRegex).html,
-);
+const scroller = new VirtualScroller(viewportEl, buffer, (text) => {
+  const html = highlight(text, query, isRegex).html;
+  const className = classifyLevel(text);
+  return className ? { html, className } : html;
+});
 
 // ---- files -----------------------------------------------------------------
 
@@ -80,12 +108,20 @@ async function loadFiles(): Promise<void> {
   try {
     const res = await apiFetch("/api/files");
     if (!res.ok) throw new Error(`files ${res.status}`);
-    const data: { files: { name: string; size: number }[] } = await res.json();
+    const data: { files: { name: string; size: number; modified_unix: number }[] } = await res.json();
     fileListEl.innerHTML = "";
     for (const f of data.files) {
       const li = document.createElement("li");
-      li.textContent = f.name;
-      li.title = `${f.size} bytes`;
+      li.dataset.file = f.name;
+      const nameEl = document.createElement("div");
+      nameEl.textContent = f.name;
+      li.appendChild(nameEl);
+      const metaEl = document.createElement("div");
+      metaEl.className = "file-meta";
+      metaEl.textContent = `${humanSize(f.size)} · ${relativeTime(f.modified_unix)}`;
+      li.appendChild(metaEl);
+      const now = Math.floor(Date.now() / 1000);
+      if (now - f.modified_unix < 60) li.classList.add("file-live");
       li.addEventListener("click", () => void openFile(f.name));
       fileListEl.appendChild(li);
     }
@@ -104,7 +140,7 @@ function closeActiveSource(): void {
 async function openFile(name: string): Promise<void> {
   currentFile = name;
   for (const child of Array.from(fileListEl.children)) {
-    child.classList.toggle("active", child.textContent === name);
+    child.classList.toggle("active", (child as HTMLElement).dataset.file === name);
   }
   closeActiveSource();
   followEl.checked = false;
@@ -113,6 +149,10 @@ async function openFile(name: string): Promise<void> {
   query = "";
   isRegex = false;
   queryEl.value = "";
+  grepMode = false;
+  currentMatchIndex = -1;
+  matchNavEl.style.display = "none";
+  clearSearchEl.style.display = "none";
   renderRail();
 
   const res = await apiFetch(`/api/tail?file=${encodeURIComponent(name)}&lines=500`);
@@ -182,8 +222,14 @@ function startGrep(): void {
   followEl.checked = false;
   buffer.clear();
   matches = [];
+  currentMatchIndex = -1;
+  grepMode = true;
   scroller.setSource(buffer);
   renderRail();
+
+  clearSearchEl.style.display = "inline-block";
+  matchNavEl.style.display = "flex";
+  matchPosEl.textContent = "…";
 
   const params = new URLSearchParams({
     file: currentFile,
@@ -203,10 +249,12 @@ function startGrep(): void {
     matches.push({ offset: d.offset, lineIndex });
     scroller.refresh();
     renderRail();
+    matchPosEl.textContent = `${matches.length}`;
   });
   es.addEventListener("done", (ev: MessageEvent) => {
     const d = JSON.parse(ev.data);
-    statusEl.textContent = `${d.matches} matches`;
+    statusEl.textContent = `${d.matches} matches${d.truncated ? " (truncated)" : ""}`;
+    matchPosEl.textContent = `${matches.length}`;
     closeActiveSource();
   });
   es.addEventListener("error", () => {
@@ -230,11 +278,32 @@ function renderRail(): void {
   }
 }
 
+// ---- match navigation ------------------------------------------------------
+
+function goToMatch(index: number): void {
+  if (matches.length === 0) return;
+  currentMatchIndex = ((index % matches.length) + matches.length) % matches.length;
+  scroller.scrollToLine(matches[currentMatchIndex].lineIndex);
+  matchPosEl.textContent = `${currentMatchIndex + 1}/${matches.length}`;
+}
+
+function nextMatch(): void { goToMatch(currentMatchIndex + 1); }
+function prevMatch(): void { goToMatch(currentMatchIndex - 1); }
+
+function clearSearch(): void {
+  if (currentFile) void openFile(currentFile);
+}
+
 // ---- wiring ----------------------------------------------------------------
 
 queryEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") startGrep();
 });
+
+searchBtnEl.addEventListener("click", startGrep);
+clearSearchEl.addEventListener("click", clearSearch);
+prevMatchEl.addEventListener("click", prevMatch);
+nextMatchEl.addEventListener("click", nextMatch);
 
 followEl.addEventListener("change", () => {
   if (followEl.checked) startFollow();
@@ -245,6 +314,26 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closeActiveSource();
     statusEl.textContent = "cancelled";
+    return;
+  }
+  // Ctrl+F / Cmd+F → focus search box (prevent browser find)
+  if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+    e.preventDefault();
+    queryEl.focus();
+    queryEl.select();
+    return;
+  }
+  // Don't handle match-nav keys when typing in an input
+  if (document.activeElement === queryEl) return;
+  if (e.key === "F3") {
+    e.preventDefault();
+    if (e.shiftKey) prevMatch(); else nextMatch();
+  } else if (e.key === "n" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    nextMatch();
+  } else if (e.key === "N" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    prevMatch();
   }
 });
 
