@@ -25,8 +25,11 @@ binary plus a systemd unit, developed and tested via `devenv` tasks.
 - Rust stable plus the `x86_64-unknown-linux-musl` target; esbuild, zig, cargo-watch
   (all from nixpkgs). No npm/node_modules.
 - Musl cross-link uses `zig cc -target x86_64-linux-musl` with
-  `rustflags = ["-C", "link-self-contained=no"]`. Do **not** remove that flag — rustc's
-  self-contained CRT collides with zig's bundled musl `crt1.o` (duplicate `_start`).
+  `-C link-self-contained=no`. Do **not** remove that flag — rustc's self-contained
+  CRT collides with zig's bundled musl `crt1.o` (duplicate `_start`). It lives in
+  `.cargo/config.toml`, but devenv's `mold.enable` sets the `RUSTFLAGS` env var,
+  which makes cargo ignore config-file rustflags — so the `logsidecar:release`
+  task also appends it to `RUSTFLAGS`. Keep both in sync.
 
 ## Build / run / test
 

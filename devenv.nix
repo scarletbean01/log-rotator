@@ -54,7 +54,13 @@
       "logsidecar:test"
     ];
 
-    "logsidecar:release".exec = "cargo build --release --target x86_64-unknown-linux-musl";
+    # mold.enable exports RUSTFLAGS, which makes cargo ignore ALL config-file
+    # rustflags (including .cargo/config.toml). Re-append the flag here or
+    # rustc links its bundled musl CRT and collides with zig's crt1.o.
+    "logsidecar:release".exec = ''
+      export RUSTFLAGS="$RUSTFLAGS -C link-self-contained=no"
+      cargo build --release --target x86_64-unknown-linux-musl
+    '';
     "logsidecar:release".after = [ "ui:build" "logsidecar:check" ];
   };
 

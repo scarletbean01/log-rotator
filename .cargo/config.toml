@@ -1,4 +1,6 @@
 [target.x86_64-unknown-linux-musl]
 linker = "zig-cc-musl"
-# zig cc provides the musl CRT + libc; rust's self-contained crt1.o would collide.
+# NOTE: only applied when RUSTFLAGS is unset (outside devenv). Inside devenv,
+# mold.enable sets RUSTFLAGS which overrides this file — the release task
+# appends the same flag to RUSTFLAGS there (devenv.nix).
 rustflags = ["-C", "link-self-contained=no"]
