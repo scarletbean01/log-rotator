@@ -9,7 +9,13 @@
   <body>
     <div id="layout">
       <aside id="sidebar">
-        <h1>logs</h1>
+        <div id="sidebar-header">
+          <h1>logs</h1>
+          <div id="file-select-actions">
+            <button id="select-all-files" type="button" title="Select all files (Ctrl+A)">all</button>
+            <button id="select-none-files" type="button" title="Clear selection (Esc)">none</button>
+          </div>
+        </div>
         <ul id="file-list"></ul>
       </aside>
       <div id="main">

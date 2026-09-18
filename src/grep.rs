@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use memchr::memmem;
 use memchr::{memchr, memrchr};
@@ -67,14 +68,14 @@ impl<'a> Scanner<'a> {
         Scanner { matcher, finder }
     }
 
-    fn make_hit(&self, file: &str, line: &[u8], offset: u64) -> Option<GrepHit> {
+    fn make_hit(&self, file: &Arc<str>, line: &[u8], offset: u64) -> Option<GrepHit> {
         let matches = self.find_matches(line);
         if matches.is_empty() {
             return None;
         }
         let decoded = String::from_utf8_lossy(line).into_owned();
         Some(GrepHit {
-            file: file.to_string(),
+            file: Arc::clone(file),
             offset,
             line: decoded,
             matches,
@@ -106,7 +107,7 @@ impl<'a> Scanner<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GrepHit {
     /// Bare filename the hit belongs to.
-    pub file: String,
+    pub file: Arc<str>,
     /// Byte offset of the start of the line within the file.
     pub offset: u64,
     pub line: String,
@@ -121,7 +122,7 @@ pub enum Direction {
 }
 
 struct GrepScan<'a> {
-    file_name: &'a str,
+    file_name: &'a Arc<str>,
     scanner: &'a Scanner<'a>,
     limit: usize,
     chunk_size: usize,
@@ -132,6 +133,7 @@ struct GrepScan<'a> {
 ///
 /// Returns the number of bytes examined. On a failed send (receiver dropped =
 /// client disconnected) the scan returns early with the bytes seen so far.
+#[allow(dead_code)]
 pub fn grep(
     path: PathBuf,
     matcher: Matcher,
@@ -141,42 +143,32 @@ pub fn grep(
     chunk_size: usize,
     tx: tokio::sync::mpsc::Sender<GrepHit>,
 ) -> io::Result<u64> {
-    if limit == 0 {
-        return Ok(0);
-    }
-    let file = File::open(&path)?;
-    let size = file.metadata()?.len();
-    if size == 0 {
-        return Ok(0);
-    }
-    let file_name = path
+    let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let chunk_size = chunk_size.max(1);
-    let scanner = Scanner::new(&matcher);
-    let mut emitted = 0usize;
-    let scan = GrepScan {
-        file_name: &file_name,
-        scanner: &scanner,
+    let (scanned, _) = grep_multi(
+        vec![(name, path)],
+        matcher,
+        direction,
+        from_offset,
         limit,
         chunk_size,
-        tx: &tx,
-    };
-    match direction {
-        Direction::Reverse => grep_reverse(&file, size, from_offset, &scan, &mut emitted),
-        Direction::Forward => grep_forward(&file, size, from_offset, &scan, &mut emitted),
-    }
+        tx,
+    )?;
+    Ok(scanned)
 }
 
 /// Scan multiple files sequentially for `matcher`, emitting hits over `tx`.
 ///
+/// `from_offset` is applied only to the first scanned file (if specified).
 /// Returns `(total_scanned_bytes, files_scanned_count)`.
 /// Stops immediately if `limit` hits are emitted or client disconnects.
 pub fn grep_multi(
     files: Vec<(String, PathBuf)>,
     matcher: Matcher,
     direction: Direction,
+    from_offset: Option<u64>,
     limit: usize,
     chunk_size: usize,
     tx: tokio::sync::mpsc::Sender<GrepHit>,
@@ -189,34 +181,47 @@ pub fn grep_multi(
     let mut total_scanned = 0u64;
     let mut emitted = 0usize;
     let mut files_scanned = 0usize;
+    let mut chunk_buf = vec![0u8; chunk_size];
 
+    let mut first_file = true;
     for (name, path) in files {
         if emitted >= limit || tx.is_closed() {
             break;
         }
         let file = match File::open(&path) {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
         let size = match file.metadata() {
             Ok(m) => m.len(),
-            Err(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
         };
         if size == 0 {
             files_scanned += 1;
+            first_file = false;
             continue;
         }
         files_scanned += 1;
+        let file_arc: Arc<str> = Arc::from(name);
         let scan = GrepScan {
-            file_name: &name,
+            file_name: &file_arc,
             scanner: &scanner,
             limit,
             chunk_size,
             tx: &tx,
         };
+        let offset = if first_file { from_offset } else { None };
+        first_file = false;
+
         let scanned = match direction {
-            Direction::Reverse => grep_reverse(&file, size, None, &scan, &mut emitted)?,
-            Direction::Forward => grep_forward(&file, size, None, &scan, &mut emitted)?,
+            Direction::Reverse => {
+                grep_reverse(&file, size, offset, &scan, &mut emitted, &mut chunk_buf)?
+            }
+            Direction::Forward => {
+                grep_forward(&file, size, offset, &scan, &mut emitted, &mut chunk_buf)?
+            }
         };
         total_scanned += scanned;
     }
@@ -231,6 +236,7 @@ fn grep_reverse(
     from_offset: Option<u64>,
     scan: &GrepScan<'_>,
     emitted: &mut usize,
+    chunk: &mut [u8],
 ) -> io::Result<u64> {
     let end = from_offset.unwrap_or(size).min(size);
 
@@ -250,12 +256,14 @@ fn grep_reverse(
     let mut tail: Vec<u8> = Vec::new();
     let mut tail_over = false;
     let mut scanned = 0u64;
-    let mut chunk = vec![0u8; scan.chunk_size];
     // Reused assembly buffer: no per-line allocation.
     let mut line_buf: Vec<u8> = Vec::new();
     let mut first_line = true;
 
     while pos > 0 {
+        if scan.tx.is_closed() {
+            return Ok(scanned);
+        }
         let read_start = pos.saturating_sub(scan.chunk_size as u64);
         let read_len = (pos - read_start) as usize;
         file.read_exact_at(&mut chunk[..read_len], read_start)?;
@@ -323,6 +331,7 @@ fn grep_forward(
     from_offset: Option<u64>,
     scan: &GrepScan<'_>,
     emitted: &mut usize,
+    chunk: &mut [u8],
 ) -> io::Result<u64> {
     let mut pos = from_offset.unwrap_or(0).min(size);
     let mut partial: Vec<u8> = Vec::new();
@@ -330,27 +339,29 @@ fn grep_forward(
     // The line being accumulated exceeds the cap: discard until its newline.
     let mut partial_over = false;
     let mut scanned = 0u64;
-    let mut buf = vec![0u8; scan.chunk_size];
     // Reused assembly buffer: no per-line allocation.
     let mut line_buf: Vec<u8> = Vec::new();
 
     while pos < size {
+        if scan.tx.is_closed() {
+            return Ok(scanned);
+        }
         let want = scan.chunk_size.min((size - pos) as usize);
-        let n = file.read_at(&mut buf[..want], pos)?;
+        let n = file.read_at(&mut chunk[..want], pos)?;
         if n == 0 {
             break;
         }
         scanned += n as u64;
-        let chunk = &buf[..n];
+        let chunk_slice = &chunk[..n];
 
         let mut line_start_idx = 0;
-        while let Some(rel) = memchr(b'\n', &chunk[line_start_idx..]) {
+        while let Some(rel) = memchr(b'\n', &chunk_slice[line_start_idx..]) {
             let i = line_start_idx + rel;
             let seg_len = i - line_start_idx;
             if !partial_over && partial.len() + seg_len <= MAX_LINE_BYTES {
                 line_buf.clear();
                 line_buf.extend_from_slice(&partial);
-                line_buf.extend_from_slice(&chunk[line_start_idx..i]);
+                line_buf.extend_from_slice(&chunk_slice[line_start_idx..i]);
                 if let Some(hit) = scan
                     .scanner
                     .make_hit(scan.file_name, &line_buf, partial_start)
@@ -370,7 +381,7 @@ fn grep_forward(
             partial_start = pos + line_start_idx as u64;
         }
 
-        partial.extend_from_slice(&chunk[line_start_idx..n]);
+        partial.extend_from_slice(&chunk_slice[line_start_idx..n]);
         if partial.len() > MAX_LINE_BYTES {
             partial.clear();
             partial_over = true;
@@ -582,7 +593,7 @@ mod tests {
         let matcher = compile(query, is_regex).unwrap();
         let files = files.into_iter().map(|(n, p)| (n.to_string(), p)).collect();
         let handle = tokio::task::spawn_blocking(move || {
-            grep_multi(files, matcher, direction, limit, chunk, tx)
+            grep_multi(files, matcher, direction, None, limit, chunk, tx)
         });
         let mut hits = Vec::new();
         while let Some(h) = rx.recv().await {
@@ -607,9 +618,9 @@ mod tests {
         let (hits, (scanned, files_scanned)) =
             run_multi(files, "ERROR", false, Direction::Forward, 100, 64).await;
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].file, "app.log");
+        assert_eq!(&*hits[0].file, "app.log");
         assert_eq!(hits[0].line, "ERROR app error");
-        assert_eq!(hits[1].file, "catalina.log");
+        assert_eq!(&*hits[1].file, "catalina.log");
         assert_eq!(hits[1].line, "ERROR cat error");
         assert_eq!(files_scanned, 3);
         assert!(scanned > 0);
@@ -630,9 +641,9 @@ mod tests {
         let (hits, (scanned, files_scanned)) =
             run_multi(files, "ERROR", false, Direction::Forward, 4, 64).await;
         assert_eq!(hits.len(), 4);
-        assert_eq!(hits[0].file, "f1.log");
-        assert_eq!(hits[2].file, "f1.log");
-        assert_eq!(hits[3].file, "f2.log");
+        assert_eq!(&*hits[0].file, "f1.log");
+        assert_eq!(&*hits[2].file, "f1.log");
+        assert_eq!(&*hits[3].file, "f2.log");
         assert_eq!(hits[3].line, "ERROR 4");
         // f3.log should never have been opened/scanned
         assert_eq!(files_scanned, 2);
@@ -652,7 +663,7 @@ mod tests {
         let (hits, (_, files_scanned)) =
             run_multi(files, "ERROR", false, Direction::Forward, 100, 64).await;
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].file, "app.log");
+        assert_eq!(&*hits[0].file, "app.log");
         assert_eq!(files_scanned, 2);
     }
 
@@ -672,12 +683,37 @@ mod tests {
         let matcher = compile("ERROR", false).unwrap();
         let files = vec![("f1.log".to_string(), p1), ("f2.log".to_string(), p2)];
         let handle = tokio::task::spawn_blocking(move || {
-            grep_multi(files, matcher, Direction::Forward, 100_000, 16, tx)
+            grep_multi(files, matcher, Direction::Forward, None, 100_000, 16, tx)
         });
         drop(rx);
         let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
             .await
             .expect("grep_multi did not stop after receiver dropped");
         res.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_client_disconnect_with_no_matches_stops_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("huge.log");
+        // Write large content with zero matching lines
+        let mut content = String::new();
+        for i in 0..20_000 {
+            content.push_str(&format!("INFO line {i}\n"));
+        }
+        write_file(&p, content.as_bytes());
+
+        let (tx, rx) = mpsc::channel::<GrepHit>(4);
+        let matcher = compile("NONEXISTENT_NEEDLE", false).unwrap();
+        let handle = tokio::task::spawn_blocking(move || {
+            grep(p, matcher, Direction::Forward, None, 100_000, 64, tx)
+        });
+        drop(rx);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("grep did not stop promptly when receiver dropped without matches");
+        let scanned = res.unwrap().unwrap();
+        // Should have exited on the first chunk rather than scanning the entire file
+        assert!(scanned < content.len() as u64);
     }
 }

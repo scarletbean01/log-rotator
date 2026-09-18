@@ -184,6 +184,9 @@ function updateFileSelectionUI(): void {
 function updateSearchPlaceholder(): void {
   if (selectedFiles.size > 1) {
     queryEl.placeholder = `search ${selectedFiles.size} files… (Enter to run, Esc to cancel)`;
+  } else if (selectedFiles.size === 1) {
+    const only = Array.from(selectedFiles)[0];
+    queryEl.placeholder = `search in ${only}… (Enter to run, Esc to cancel)`;
   } else if (currentFile) {
     queryEl.placeholder = `search in ${currentFile}… (Enter to run, Esc to cancel)`;
   } else {
@@ -324,7 +327,7 @@ function startFollow(fromOffset?: number): void {
   es.addEventListener("line", (ev: MessageEvent) => {
     const d = JSON.parse(ev.data);
     const wasPinned = scroller.isPinnedToBottom();
-    buffer.push(d.offset, d.line);
+    buffer.push(d.offset, d.line, currentFile ?? undefined);
     scroller.refresh();
     if (wasPinned) scroller.scrollToBottom();
   });
@@ -347,7 +350,7 @@ function startFollow(fromOffset?: number): void {
 // ---- grep ------------------------------------------------------------------
 
 function startGrep(): void {
-  const files = selectedFiles.size > 1
+  const files = selectedFiles.size > 0
     ? Array.from(selectedFiles)
     : currentFile ? [currentFile] : [];
   if (files.length === 0) return;
@@ -407,6 +410,27 @@ function startGrep(): void {
     ? `searching ${files.length} files…`
     : "searching…";
 
+  let scrollerRaf = false;
+  let railRaf = false;
+  function scheduleScroller(): void {
+    if (!scrollerRaf) {
+      scrollerRaf = true;
+      requestAnimationFrame(() => {
+        scrollerRaf = false;
+        scroller.refresh();
+      });
+    }
+  }
+  function scheduleRail(): void {
+    if (!railRaf) {
+      railRaf = true;
+      requestAnimationFrame(() => {
+        railRaf = false;
+        renderRail();
+      });
+    }
+  }
+
   es.addEventListener("match", (ev: MessageEvent) => {
     const d = JSON.parse(ev.data);
     const hitFile = (d.file as string) || files[0] || "";
@@ -414,26 +438,39 @@ function startGrep(): void {
       const lineIndex = buffer.length();
       buffer.push(d.offset, d.line, hitFile);
       matches.push({ file: hitFile, offset: d.offset, lineIndex });
-      scroller.refresh();
-      appendRailTick(d.offset, hitFile);
+      scheduleScroller();
+      if (multiFileGrep) {
+        scheduleRail();
+      } else {
+        appendRailTick(d.offset, hitFile);
+      }
       matchPosEl.textContent = `${matches.length}`;
     } else {
       if (!grepBuffer) grepBuffer = new LineBuffer();
       const lineIndex = grepBuffer.length();
       grepBuffer.push(d.offset, d.line, hitFile);
       matches.push({ file: hitFile, offset: d.offset, lineIndex });
-      appendRailTick(d.offset, hitFile);
+      if (multiFileGrep) {
+        scheduleRail();
+      } else {
+        appendRailTick(d.offset, hitFile);
+      }
       matchPosEl.textContent = `${currentMatchIndex >= 0 ? currentMatchIndex + 1 : 1}/${matches.length}`;
     }
   });
   es.addEventListener("done", (ev: MessageEvent) => {
     const d = JSON.parse(ev.data);
-    if (typeof d.scanned_bytes === "number" && d.scanned_bytes > 0) {
+    if (!multiFileGrep && typeof d.scanned_bytes === "number" && d.scanned_bytes > 0) {
       fileSize = d.scanned_bytes;
       renderRail();
+    } else if (multiFileGrep) {
+      renderRail();
     }
+    scroller.refresh();
     if (grepMode) {
-      const filesPart = d.files_scanned ? ` across ${d.files_scanned} files` : "";
+      const filesPart = d.files_scanned
+        ? ` across ${d.files_scanned} file${d.files_scanned === 1 ? "" : "s"}`
+        : "";
       statusEl.textContent = `${d.matches} matches${filesPart}${d.truncated ? " (truncated)" : ""}`;
       matchPosEl.textContent = `${matches.length}`;
     }
@@ -597,7 +634,9 @@ function goToMatch(index: number): void {
   currentMatchIndex = ((index % matches.length) + matches.length) % matches.length;
   const m = matches[currentMatchIndex];
   if (grepMode) {
+    activeAnchorLineIndex = m.lineIndex;
     scroller.scrollToLine(m.lineIndex);
+    scroller.refresh();
   } else {
     // If the match is in the same file and already inside the context window, scroll locally.
     if (m.file === currentFile) {
@@ -662,9 +701,13 @@ function clearSearch(): void {
   matchNavEl.style.display = "none";
   renderRail();
 
-  if (preSearchState && preSearchState.file === currentFile) {
+  if (preSearchState) {
     const saved = preSearchState;
     preSearchState = null;
+    currentFile = saved.file;
+    for (const child of Array.from(fileListEl.children)) {
+      child.classList.toggle("active", (child as HTMLElement).dataset.file === saved.file);
+    }
     buffer.setAll(saved.lines);
     fileSize = saved.fileSize;
     scroller.setSource(buffer);
@@ -680,6 +723,10 @@ function clearSearch(): void {
   } else if (currentFile) {
     preSearchState = null;
     void openFile(currentFile);
+  } else {
+    buffer.clear();
+    scroller.refresh();
+    statusEl.textContent = "";
   }
 }
 
@@ -769,10 +816,25 @@ sidebarEl.addEventListener("keydown", (e) => {
     }
     updateFileSelectionUI();
   } else if (e.key === "Escape") {
+    e.stopPropagation();
     selectedFiles.clear();
     if (currentFile) selectedFiles.add(currentFile);
     updateFileSelectionUI();
   }
+});
+
+document.getElementById("select-all-files")?.addEventListener("click", () => {
+  for (const child of Array.from(fileListEl.children)) {
+    const name = (child as HTMLElement).dataset.file;
+    if (name) selectedFiles.add(name);
+  }
+  updateFileSelectionUI();
+});
+
+document.getElementById("select-none-files")?.addEventListener("click", () => {
+  selectedFiles.clear();
+  if (currentFile) selectedFiles.add(currentFile);
+  updateFileSelectionUI();
 });
 
 window.addEventListener("keydown", (e) => {

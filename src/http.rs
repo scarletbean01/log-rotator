@@ -298,21 +298,32 @@ async fn handle_grep(
     };
     let limit = p.limit.unwrap_or(1000).clamp(1, 10000);
 
+    if p.file.is_some() && p.files.is_some() {
+        return Err(AppError::BadRequest(
+            "specify either 'file' or 'files', not both".into(),
+        ));
+    }
+
     let mut resolved_files: Vec<(String, PathBuf)> = Vec::new();
     if let Some(files_str) = &p.files {
+        let mut tokens = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for raw in files_str.split(',') {
             let name = raw.trim();
-            if name.is_empty() {
+            if name.is_empty() || !seen.insert(name.to_string()) {
                 continue;
             }
-            let path = pathguard::resolve_under_root(&state.root, name)?;
-            resolved_files.push((name.to_string(), path));
+            tokens.push(name);
         }
-        if resolved_files.is_empty() {
+        if tokens.is_empty() {
             return Err(AppError::BadRequest("no files specified".into()));
         }
-        if resolved_files.len() > 50 {
+        if tokens.len() > 50 {
             return Err(AppError::BadRequest("too many files (maximum 50)".into()));
+        }
+        for name in tokens {
+            let path = pathguard::resolve_under_root(&state.root, name)?;
+            resolved_files.push((name.to_string(), path));
         }
     } else if let Some(file_str) = &p.file {
         let path = pathguard::resolve_under_root(&state.root, file_str)?;
@@ -323,15 +334,11 @@ async fn handle_grep(
         ));
     }
 
-    // Sort files by modified timestamp: newest first for Reverse, oldest first for Forward.
-    resolved_files.sort_by(|(_, p1), (_, p2)| {
-        let t1 = p1.metadata().and_then(|m| m.modified()).ok();
-        let t2 = p2.metadata().and_then(|m| m.modified()).ok();
-        match direction {
-            Direction::Reverse => t2.cmp(&t1),
-            Direction::Forward => t1.cmp(&t2),
-        }
-    });
+    if resolved_files.len() > 1 && p.from_offset.is_some() {
+        return Err(AppError::BadRequest(
+            "from_offset is only supported for single-file search".into(),
+        ));
+    }
 
     // Gate concurrent searches; permit is released when the stream ends.
     let permit = state
@@ -342,7 +349,6 @@ async fn handle_grep(
 
     let chunk = state.chunk_size;
     let from_offset = p.from_offset;
-    let is_single = resolved_files.len() == 1;
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
 
     tokio::spawn(async move {
@@ -351,28 +357,35 @@ async fn handle_grep(
         let scan_limit = limit.saturating_add(1);
         let (hit_tx, mut hit_rx) = mpsc::channel::<grep::GrepHit>(100);
         let join = tokio::task::spawn_blocking(move || {
-            if is_single && from_offset.is_some() {
-                let (_name, path) = resolved_files.into_iter().next().unwrap();
-                let scanned = grep::grep(
-                    path,
-                    matcher,
-                    direction,
-                    from_offset,
-                    scan_limit,
-                    chunk,
-                    hit_tx,
-                )?;
-                Ok((scanned, 1))
-            } else {
-                grep::grep_multi(
-                    resolved_files,
-                    matcher,
-                    direction,
-                    scan_limit,
-                    chunk,
-                    hit_tx,
-                )
-            }
+            // Sort files by modified timestamp in the blocking thread.
+            // Cache mtime once per file to avoid O(N log N) stat syscalls.
+            let mut entries: Vec<(String, PathBuf, Option<std::time::SystemTime>)> = resolved_files
+                .into_iter()
+                .map(|(name, path)| {
+                    let mtime = path.metadata().and_then(|m| m.modified()).ok();
+                    (name, path, mtime)
+                })
+                .collect();
+
+            entries.sort_by(|(n1, _p1, t1), (n2, _p2, t2)| match direction {
+                Direction::Reverse => t2.cmp(t1).then_with(|| n2.cmp(n1)),
+                Direction::Forward => t1.cmp(t2).then_with(|| n1.cmp(n2)),
+            });
+
+            let sorted_files: Vec<(String, PathBuf)> = entries
+                .into_iter()
+                .map(|(name, path, _)| (name, path))
+                .collect();
+
+            grep::grep_multi(
+                sorted_files,
+                matcher,
+                direction,
+                from_offset,
+                scan_limit,
+                chunk,
+                hit_tx,
+            )
         });
 
         let mut matches = 0u64;
@@ -724,6 +737,48 @@ mod tests {
         let state = test_state(dir.path(), None, 2);
         let resp = request(&state, "/api/grep?query=ERROR", None).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_both_file_and_files_returns_400() {
+        let dir = setup_root();
+        let state = test_state(dir.path(), None, 2);
+        let resp = request(
+            &state,
+            "/api/grep?file=catalina.out&files=catalina.out&query=ERROR",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_from_offset_with_multi_files_returns_400() {
+        let dir = setup_root();
+        std::fs::write(dir.path().join("localhost.log"), "line\n").unwrap();
+        let state = test_state(dir.path(), None, 2);
+        let resp = request(
+            &state,
+            "/api/grep?files=catalina.out,localhost.log&from_offset=10&query=ERROR",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_multi_files_deduplicates_names() {
+        let dir = setup_root();
+        let state = test_state(dir.path(), None, 2);
+        let resp = request(
+            &state,
+            "/api/grep?files=catalina.out,catalina.out&query=ERROR",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_body(resp).await;
+        assert!(text.contains("\"files_scanned\":1"), "body: {text}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

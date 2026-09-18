@@ -34,12 +34,39 @@ html, body {
   overflow-y: auto;
 }
 
+#sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
 #sidebar h1 {
   font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);
-  margin: 0 0 10px;
+  margin: 0;
+}
+
+#file-select-actions {
+  display: flex;
+  gap: 4px;
+}
+
+#file-select-actions button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+#file-select-actions button:hover {
+  color: var(--fg);
+  border-color: var(--accent);
 }
 
 #file-list {
@@ -173,7 +200,7 @@ html, body {
   opacity: 0.9;
   font-size: 0.85em;
   padding: 0 6px 0 12px;
-  max-width: 140px;
+  width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
