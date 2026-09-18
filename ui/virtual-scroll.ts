@@ -4,6 +4,7 @@
 export interface LineData {
   offset: number;
   text: string;
+  file?: string;
 }
 
 export interface LineSource {
@@ -12,7 +13,12 @@ export interface LineSource {
 }
 
 export type RenderResult = { html: string; className?: string };
-export type RowRenderer = (text: string, offset: number, index: number) => string | RenderResult;
+export type RowRenderer = (
+  text: string,
+  offset: number,
+  index: number,
+  file?: string,
+) => string | RenderResult;
 
 export class VirtualScroller {
   private viewport: HTMLElement;
@@ -118,7 +124,8 @@ export class VirtualScroller {
       row.style.height = `${this.lineHeight}px`;
       row.dataset.offset = String(d.offset);
       row.dataset.index = String(i);
-      const result = this.renderRow(d.text, d.offset, i);
+      if (d.file) row.dataset.file = d.file;
+      const result = this.renderRow(d.text, d.offset, i, d.file);
       if (typeof result === "string") {
         row.className = "row";
         row.innerHTML = result;

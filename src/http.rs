@@ -272,7 +272,8 @@ async fn handle_tail(
 
 #[derive(Deserialize)]
 struct GrepParams {
-    file: String,
+    file: Option<String>,
+    files: Option<String>,
     query: String,
     is_regex: Option<bool>,
     direction: Option<String>,
@@ -284,7 +285,6 @@ async fn handle_grep(
     State(state): State<AppState>,
     Query(p): Query<GrepParams>,
 ) -> Result<Response, AppError> {
-    let path = pathguard::resolve_under_root(&state.root, &p.file)?;
     let is_regex = p.is_regex.unwrap_or(false);
     let matcher = grep::compile(&p.query, is_regex).map_err(AppError::from)?;
     let direction = match p.direction.as_deref() {
@@ -298,6 +298,41 @@ async fn handle_grep(
     };
     let limit = p.limit.unwrap_or(1000).clamp(1, 10000);
 
+    let mut resolved_files: Vec<(String, PathBuf)> = Vec::new();
+    if let Some(files_str) = &p.files {
+        for raw in files_str.split(',') {
+            let name = raw.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let path = pathguard::resolve_under_root(&state.root, name)?;
+            resolved_files.push((name.to_string(), path));
+        }
+        if resolved_files.is_empty() {
+            return Err(AppError::BadRequest("no files specified".into()));
+        }
+        if resolved_files.len() > 50 {
+            return Err(AppError::BadRequest("too many files (maximum 50)".into()));
+        }
+    } else if let Some(file_str) = &p.file {
+        let path = pathguard::resolve_under_root(&state.root, file_str)?;
+        resolved_files.push((file_str.clone(), path));
+    } else {
+        return Err(AppError::BadRequest(
+            "missing 'file' or 'files' query parameter".into(),
+        ));
+    }
+
+    // Sort files by modified timestamp: newest first for Reverse, oldest first for Forward.
+    resolved_files.sort_by(|(_, p1), (_, p2)| {
+        let t1 = p1.metadata().and_then(|m| m.modified()).ok();
+        let t2 = p2.metadata().and_then(|m| m.modified()).ok();
+        match direction {
+            Direction::Reverse => t2.cmp(&t1),
+            Direction::Forward => t1.cmp(&t2),
+        }
+    });
+
     // Gate concurrent searches; permit is released when the stream ends.
     let permit = state
         .search_semaphore
@@ -307,6 +342,7 @@ async fn handle_grep(
 
     let chunk = state.chunk_size;
     let from_offset = p.from_offset;
+    let is_single = resolved_files.len() == 1;
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
 
     tokio::spawn(async move {
@@ -315,15 +351,28 @@ async fn handle_grep(
         let scan_limit = limit.saturating_add(1);
         let (hit_tx, mut hit_rx) = mpsc::channel::<grep::GrepHit>(100);
         let join = tokio::task::spawn_blocking(move || {
-            grep::grep(
-                path,
-                matcher,
-                direction,
-                from_offset,
-                scan_limit,
-                chunk,
-                hit_tx,
-            )
+            if is_single && from_offset.is_some() {
+                let (_name, path) = resolved_files.into_iter().next().unwrap();
+                let scanned = grep::grep(
+                    path,
+                    matcher,
+                    direction,
+                    from_offset,
+                    scan_limit,
+                    chunk,
+                    hit_tx,
+                )?;
+                Ok((scanned, 1))
+            } else {
+                grep::grep_multi(
+                    resolved_files,
+                    matcher,
+                    direction,
+                    scan_limit,
+                    chunk,
+                    hit_tx,
+                )
+            }
         });
 
         let mut matches = 0u64;
@@ -346,13 +395,14 @@ async fn handle_grep(
         drop(hit_rx);
 
         match join.await {
-            Ok(Ok(scanned)) => {
+            Ok(Ok((scanned, files_scanned))) => {
                 let ev = Event::default()
                     .event("done")
                     .json_data(serde_json::json!({
                         "matches": matches,
                         "scanned_bytes": scanned,
                         "truncated": truncated,
+                        "files_scanned": files_scanned,
                     }))
                     .expect("done event serializes");
                 let _ = tx.send(Ok(ev)).await;
@@ -644,6 +694,36 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_multi_files_returns_hits_and_files_scanned() {
+        let dir = setup_root();
+        // Add a second log file with an ERROR
+        std::fs::write(dir.path().join("localhost.log"), "localhost ERROR line\n").unwrap();
+        let state = test_state(dir.path(), None, 2);
+        let resp = request(
+            &state,
+            "/api/grep?files=catalina.out,localhost.log&query=ERROR",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_body(resp).await;
+        assert!(text.contains("event: match"), "body: {text}");
+        assert!(text.contains("\"file\":\"catalina.out\""), "body: {text}");
+        assert!(text.contains("\"file\":\"localhost.log\""), "body: {text}");
+        assert!(text.contains("event: done"), "body: {text}");
+        assert!(text.contains("\"matches\":2"), "body: {text}");
+        assert!(text.contains("\"files_scanned\":2"), "body: {text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grep_missing_files_param_returns_400() {
+        let dir = setup_root();
+        let state = test_state(dir.path(), None, 2);
+        let resp = request(&state, "/api/grep?query=ERROR", None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -89,17 +89,19 @@ of `lines` centred on `around_offset` (byte offset of an anchor line) if specifi
 
 `anchor_line` is 0-based and present only when `around_offset` is provided.
 
-### `GET /api/grep?file=<name>&query=<q>&is_regex=false&direction=reverse&from_offset=&limit=1000`
+### `GET /api/grep?file=<name>&files=<names>&query=<q>&is_regex=false&direction=reverse&from_offset=&limit=1000`
 
-Server-Sent Events. `direction` is `reverse` (newest-first) or `forward`;
-`limit` is clamped 1..=10000. Emits `match` events then a terminal `done`:
+Server-Sent Events. Either `file=<name>` (single file) or `files=<name1,name2>`
+(comma-separated list of up to 50 files) is required. `direction` is `reverse`
+(newest-first) or `forward`; `limit` is clamped 1..=10000. Emits `match` events
+then a terminal `done`:
 
 ```
 event: match
-data: {"offset":123,"line":"...","matches":[[0,5]]}
+data: {"file":"catalina.out","offset":123,"line":"...","matches":[[0,5]]}
 
 event: done
-data: {"matches":5,"scanned_bytes":6888895,"truncated":false}
+data: {"matches":5,"scanned_bytes":6888895,"truncated":false,"files_scanned":1}
 ```
 
 An invalid regex or `direction` value returns `400`. `truncated` is exact:

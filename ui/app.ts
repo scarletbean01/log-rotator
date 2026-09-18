@@ -71,8 +71,8 @@ class LineBuffer implements LineSource {
     return this.lines[index];
   }
 
-  push(offset: number, text: string): void {
-    this.lines.push({ offset, text });
+  push(offset: number, text: string, file?: string): void {
+    this.lines.push({ offset, text, file });
   }
 
   clear(): void {
@@ -90,6 +90,7 @@ class LineBuffer implements LineSource {
 
 // ---- DOM -------------------------------------------------------------------
 
+const sidebarEl = document.getElementById("sidebar") as HTMLElement;
 const fileListEl = document.getElementById("file-list") as HTMLUListElement;
 const queryEl = document.getElementById("query") as HTMLInputElement;
 const regexEl = document.getElementById("regex") as HTMLInputElement;
@@ -110,13 +111,15 @@ const tailLimitEl = document.getElementById("tail-limit") as HTMLSelectElement;
 // ---- state -----------------------------------------------------------------
 
 let currentFile: string | null = null;
+let selectedFiles = new Set<string>();
+let multiFileGrep = false;
 let fileSize = 0;
 let query = "";
 let isRegex = false;
 let activeSource: EventSource | null = null;
 let buffer = new LineBuffer();
 let grepBuffer: LineBuffer | null = null;
-let matches: { offset: number; lineIndex: number }[] = [];
+let matches: { file: string; offset: number; lineIndex: number }[] = [];
 let currentMatchIndex = -1;
 let grepMode = false;
 let activeAnchorOffset: number | null = null;
@@ -130,13 +133,17 @@ let preSearchState: {
   wasFollow: boolean;
 } | null = null;
 
-const scroller = new VirtualScroller(viewportEl, buffer, (text, offset, index) => {
+const scroller = new VirtualScroller(viewportEl, buffer, (text, offset, index, file) => {
   const levelClass = classifyLevel(text);
   const classes: string[] = [];
   if (levelClass) classes.push(levelClass);
   if (grepMode) classes.push("grep-result");
   if (activeAnchorLineIndex !== null && index === activeAnchorLineIndex) classes.push("row-anchor");
   const className = classes.length > 0 ? classes.join(" ") : undefined;
+
+  const fileBadge = multiFileGrep && file && grepMode
+    ? `<span class="row-file" title="${escHtml(file)}">${escHtml(file)}</span>`
+    : "";
 
   const ts = parseTimestamp(text);
   let html: string;
@@ -147,9 +154,9 @@ const scroller = new VirtualScroller(viewportEl, buffer, (text, offset, index) =
       ? `${ts.full} · ${relativeTs(ts.date)}`
       : ts.full;
     const tsHtml = `<span class="row-ts" title="${escHtml(tooltip)}">${escHtml(ts.display)}</span>`;
-    html = `${tsHtml}<span class="row-msg">${msgHtml}</span>`;
+    html = `${fileBadge}${tsHtml}<span class="row-msg">${msgHtml}</span>`;
   } else {
-    html = `<span class="row-msg">${highlight(text, query, isRegex).html}</span>`;
+    html = `${fileBadge}<span class="row-msg">${highlight(text, query, isRegex).html}</span>`;
   }
   return className ? { html, className } : html;
 });
@@ -161,6 +168,29 @@ function escHtml(s: string): string {
 
 // ---- files -----------------------------------------------------------------
 
+function updateFileSelectionUI(): void {
+  for (const child of Array.from(fileListEl.children)) {
+    const el = child as HTMLElement;
+    const name = el.dataset.file;
+    if (name) {
+      el.classList.toggle("selected", selectedFiles.has(name));
+      const check = el.querySelector(".file-check") as HTMLInputElement | null;
+      if (check) check.checked = selectedFiles.has(name);
+    }
+  }
+  updateSearchPlaceholder();
+}
+
+function updateSearchPlaceholder(): void {
+  if (selectedFiles.size > 1) {
+    queryEl.placeholder = `search ${selectedFiles.size} files… (Enter to run, Esc to cancel)`;
+  } else if (currentFile) {
+    queryEl.placeholder = `search in ${currentFile}… (Enter to run, Esc to cancel)`;
+  } else {
+    queryEl.placeholder = "search… (Enter to run, Esc to cancel)";
+  }
+}
+
 async function loadFiles(): Promise<void> {
   try {
     const res = await apiFetch("/api/files");
@@ -170,18 +200,47 @@ async function loadFiles(): Promise<void> {
     for (const f of data.files) {
       const li = document.createElement("li");
       li.dataset.file = f.name;
+
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.className = "file-check";
+      check.title = "Select for multi-file search";
+      check.checked = selectedFiles.has(f.name);
+      check.addEventListener("click", (e) => e.stopPropagation());
+      check.addEventListener("change", () => {
+        if (check.checked) {
+          selectedFiles.add(f.name);
+        } else {
+          selectedFiles.delete(f.name);
+        }
+        updateFileSelectionUI();
+      });
+      li.appendChild(check);
+
+      const contentDiv = document.createElement("div");
+      contentDiv.className = "file-content";
+
       const nameEl = document.createElement("div");
+      nameEl.className = "file-name";
       nameEl.textContent = f.name;
-      li.appendChild(nameEl);
+      contentDiv.appendChild(nameEl);
+
       const metaEl = document.createElement("div");
       metaEl.className = "file-meta";
       metaEl.textContent = `${humanSize(f.size)} · ${relativeTime(f.modified_unix)}`;
-      li.appendChild(metaEl);
+      contentDiv.appendChild(metaEl);
+
+      li.appendChild(contentDiv);
+
       const now = Math.floor(Date.now() / 1000);
       if (now - f.modified_unix < 60) li.classList.add("file-live");
+      if (selectedFiles.has(f.name)) li.classList.add("selected");
+      if (currentFile === f.name) li.classList.add("active");
+
       li.addEventListener("click", () => void openFile(f.name));
       fileListEl.appendChild(li);
     }
+    updateSearchPlaceholder();
   } catch (e) {
     statusEl.textContent = `failed to load files: ${e}`;
   }
@@ -196,6 +255,12 @@ function closeActiveSource(): void {
 
 async function openFile(name: string): Promise<void> {
   currentFile = name;
+  if (selectedFiles.size <= 1) {
+    selectedFiles.clear();
+    selectedFiles.add(name);
+  }
+  updateFileSelectionUI();
+
   for (const child of Array.from(fileListEl.children)) {
     child.classList.toggle("active", (child as HTMLElement).dataset.file === name);
   }
@@ -215,6 +280,7 @@ async function openFile(name: string): Promise<void> {
   isRegex = false;
   queryEl.value = "";
   grepMode = false;
+  multiFileGrep = false;
   currentMatchIndex = -1;
   matchNavEl.style.display = "none";
   clearSearchEl.style.display = "none";
@@ -233,7 +299,7 @@ async function openFile(name: string): Promise<void> {
   const encoder = new TextEncoder();
   let off = data.start_offset as number;
   for (const line of data.lines as string[]) {
-    buffer.push(off, line);
+    buffer.push(off, line, name);
     off += encoder.encode(line).length + 1; // +1 for the '\n'
   }
 
@@ -281,14 +347,18 @@ function startFollow(fromOffset?: number): void {
 // ---- grep ------------------------------------------------------------------
 
 function startGrep(): void {
-  if (!currentFile) return;
+  const files = selectedFiles.size > 1
+    ? Array.from(selectedFiles)
+    : currentFile ? [currentFile] : [];
+  if (files.length === 0) return;
   const q = queryEl.value;
   if (!q) return;
   query = q;
   isRegex = regexEl.checked;
   const direction = directionEl.value;
+  multiFileGrep = files.length > 1;
 
-  if (!preSearchState) {
+  if (!preSearchState && currentFile) {
     preSearchState = {
       file: currentFile,
       lines: buffer.getAll(),
@@ -320,31 +390,39 @@ function startGrep(): void {
   matchPosEl.textContent = "…";
 
   const params = new URLSearchParams({
-    file: currentFile,
     query: q,
     is_regex: String(isRegex),
     direction,
     limit: "1000",
   });
+  if (files.length === 1) {
+    params.set("file", files[0]);
+  } else {
+    params.set("files", files.join(","));
+  }
+
   const es = new EventSource(sseUrl(`/api/grep?${params.toString()}`));
   activeSource = es;
-  statusEl.textContent = "searching…";
+  statusEl.textContent = multiFileGrep
+    ? `searching ${files.length} files…`
+    : "searching…";
 
   es.addEventListener("match", (ev: MessageEvent) => {
     const d = JSON.parse(ev.data);
+    const hitFile = (d.file as string) || files[0] || "";
     if (grepMode) {
       const lineIndex = buffer.length();
-      buffer.push(d.offset, d.line);
-      matches.push({ offset: d.offset, lineIndex });
+      buffer.push(d.offset, d.line, hitFile);
+      matches.push({ file: hitFile, offset: d.offset, lineIndex });
       scroller.refresh();
-      appendRailTick(d.offset);
+      appendRailTick(d.offset, hitFile);
       matchPosEl.textContent = `${matches.length}`;
     } else {
       if (!grepBuffer) grepBuffer = new LineBuffer();
       const lineIndex = grepBuffer.length();
-      grepBuffer.push(d.offset, d.line);
-      matches.push({ offset: d.offset, lineIndex });
-      appendRailTick(d.offset);
+      grepBuffer.push(d.offset, d.line, hitFile);
+      matches.push({ file: hitFile, offset: d.offset, lineIndex });
+      appendRailTick(d.offset, hitFile);
       matchPosEl.textContent = `${currentMatchIndex >= 0 ? currentMatchIndex + 1 : 1}/${matches.length}`;
     }
   });
@@ -355,7 +433,8 @@ function startGrep(): void {
       renderRail();
     }
     if (grepMode) {
-      statusEl.textContent = `${d.matches} matches${d.truncated ? " (truncated)" : ""}`;
+      const filesPart = d.files_scanned ? ` across ${d.files_scanned} files` : "";
+      statusEl.textContent = `${d.matches} matches${filesPart}${d.truncated ? " (truncated)" : ""}`;
       matchPosEl.textContent = `${matches.length}`;
     }
     closeActiveSource();
@@ -368,8 +447,10 @@ function startGrep(): void {
 
 // ---- context around match --------------------------------------------------
 
-async function showContextAround(anchorOffset: number): Promise<void> {
-  if (!currentFile) return;
+async function showContextAround(anchorOffset: number, file?: string): Promise<void> {
+  const targetFile = file || currentFile;
+  if (!targetFile) return;
+
   // Leaving grep view: release the server search permit instead of letting
   // the abandoned SSE hold it (--max-searches) until the scan finishes.
   closeActiveSource();
@@ -389,15 +470,19 @@ async function showContextAround(anchorOffset: number): Promise<void> {
   followEl.checked = false;
   activeAnchorOffset = anchorOffset;
   activeAnchorLineIndex = null;
+  currentFile = targetFile;
+  for (const child of Array.from(fileListEl.children)) {
+    child.classList.toggle("active", (child as HTMLElement).dataset.file === targetFile);
+  }
 
   if (grepBuffer) {
     backToSearchEl.style.display = "inline-block";
   }
 
-  statusEl.textContent = "loading context…";
+  statusEl.textContent = `loading context in ${targetFile}…`;
   try {
     const res = await apiFetch(
-      `/api/tail?file=${encodeURIComponent(currentFile)}&lines=${tailLimitEl.value}&around_offset=${anchorOffset}`,
+      `/api/tail?file=${encodeURIComponent(targetFile)}&lines=${tailLimitEl.value}&around_offset=${anchorOffset}`,
       false,
       currentAbort.signal,
     );
@@ -412,7 +497,7 @@ async function showContextAround(anchorOffset: number): Promise<void> {
     const encoder = new TextEncoder();
     let off = data.start_offset as number;
     for (const line of data.lines as string[]) {
-      buffer.push(off, line);
+      buffer.push(off, line, targetFile);
       off += encoder.encode(line).length + 1;
     }
 
@@ -420,14 +505,14 @@ async function showContextAround(anchorOffset: number): Promise<void> {
     activeAnchorLineIndex = targetIndex;
     scroller.setSourceCentered(buffer, targetIndex);
 
-    const mIdx = matches.findIndex((m) => m.offset === anchorOffset);
+    const mIdx = matches.findIndex((m) => m.offset === anchorOffset && m.file === targetFile);
     if (mIdx >= 0) {
       currentMatchIndex = mIdx;
       matchPosEl.textContent = `${currentMatchIndex + 1}/${matches.length}`;
     }
 
     clearSearchEl.style.display = "inline-block";
-    statusEl.textContent = `${currentFile} — ${buffer.length()} lines (around match)`;
+    statusEl.textContent = `${targetFile} — ${buffer.length()} lines (around match)`;
   } catch (e) {
     if ((e as Error).name === "AbortError") return;
     statusEl.textContent = `context load failed: ${e}`;
@@ -446,6 +531,7 @@ function backToSearch(): void {
   activeAnchorLineIndex = null;
   scroller.setSource(buffer);
   backToSearchEl.style.display = "none";
+  renderRail();
   if (currentMatchIndex >= 0 && currentMatchIndex < matches.length) {
     scroller.scrollToLine(matches[currentMatchIndex].lineIndex);
     matchPosEl.textContent = `${currentMatchIndex + 1}/${matches.length}`;
@@ -457,32 +543,50 @@ function backToSearch(): void {
 
 // ---- match rail ------------------------------------------------------------
 
-function makeTick(offset: number, railHeight: number): HTMLDivElement {
+function makeTick(offset: number, file: string, topPx: number): HTMLDivElement {
   const tick = document.createElement("div");
   tick.className = "tick";
   tick.dataset.offset = String(offset);
-  tick.style.top = `${Math.min(1, offset / fileSize) * railHeight}px`;
+  tick.dataset.file = file;
+  tick.style.top = `${topPx}px`;
   return tick;
 }
 
-function appendRailTick(offset: number): void {
-  if (fileSize === 0) return; // positioned once `done` reports the file size
-  railEl.appendChild(makeTick(offset, railEl.clientHeight));
+function appendRailTick(offset: number, file: string): void {
+  const railHeight = railEl.clientHeight;
+  if (multiFileGrep) {
+    const topPx = matches.length > 0 ? ((matches.length - 1) / Math.max(1, matches.length)) * railHeight : 0;
+    railEl.appendChild(makeTick(offset, file, topPx));
+  } else {
+    if (fileSize === 0) return; // positioned once `done` reports the file size
+    railEl.appendChild(makeTick(offset, file, Math.min(1, offset / fileSize) * railHeight));
+  }
 }
 
 function renderRail(): void {
   railEl.innerHTML = "";
-  if (fileSize === 0 || matches.length === 0) return;
+  if (matches.length === 0) return;
   const railHeight = railEl.clientHeight;
-  for (const m of matches) {
-    railEl.appendChild(makeTick(m.offset, railHeight));
+  if (multiFileGrep) {
+    for (let i = 0; i < matches.length; i++) {
+      const m = matches[i];
+      const topPx = (i / matches.length) * railHeight;
+      railEl.appendChild(makeTick(m.offset, m.file, topPx));
+    }
+  } else {
+    if (fileSize === 0) return;
+    for (const m of matches) {
+      railEl.appendChild(makeTick(m.offset, m.file, Math.min(1, m.offset / fileSize) * railHeight));
+    }
   }
 }
 
 railEl.addEventListener("click", (e) => {
   const tick = (e.target as HTMLElement).closest(".tick") as HTMLElement | null;
   if (!tick) return;
-  const idx = matches.findIndex((m) => m.offset === Number(tick.dataset.offset));
+  const offset = Number(tick.dataset.offset);
+  const file = tick.dataset.file;
+  const idx = matches.findIndex((m) => m.offset === offset && (!file || m.file === file));
   if (idx >= 0) goToMatch(idx);
 });
 
@@ -495,17 +599,19 @@ function goToMatch(index: number): void {
   if (grepMode) {
     scroller.scrollToLine(m.lineIndex);
   } else {
-    // Adjacent match already inside the context window? Scroll locally
-    // instead of clearing the buffer and refetching over HTTP.
-    const localIdx = bufferLineIndexForOffset(m.offset);
-    if (localIdx !== null) {
-      activeAnchorOffset = m.offset;
-      activeAnchorLineIndex = localIdx;
-      scroller.scrollToLineCentered(localIdx);
-      scroller.refresh(); // re-render even if scrollTop did not change
-    } else {
-      void showContextAround(m.offset);
+    // If the match is in the same file and already inside the context window, scroll locally.
+    if (m.file === currentFile) {
+      const localIdx = bufferLineIndexForOffset(m.offset);
+      if (localIdx !== null) {
+        activeAnchorOffset = m.offset;
+        activeAnchorLineIndex = localIdx;
+        scroller.scrollToLineCentered(localIdx);
+        scroller.refresh();
+        matchPosEl.textContent = `${currentMatchIndex + 1}/${matches.length}`;
+        return;
+      }
     }
+    void showContextAround(m.offset, m.file);
   }
   matchPosEl.textContent = `${currentMatchIndex + 1}/${matches.length}`;
 }
@@ -544,6 +650,7 @@ function clearSearch(): void {
   activeAnchorOffset = null;
   activeAnchorLineIndex = null;
   grepMode = false;
+  multiFileGrep = false;
   grepBuffer = null;
   query = "";
   isRegex = false;
@@ -648,7 +755,24 @@ viewportEl.addEventListener("click", (e) => {
   const row = (e.target as HTMLElement).closest(".row") as HTMLElement | null;
   if (!row || !row.dataset.offset) return;
   const offset = Number(row.dataset.offset);
-  void showContextAround(offset);
+  const file = row.dataset.file;
+  void showContextAround(offset, file);
+});
+
+sidebarEl.tabIndex = 0;
+sidebarEl.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "a") {
+    e.preventDefault();
+    for (const child of Array.from(fileListEl.children)) {
+      const name = (child as HTMLElement).dataset.file;
+      if (name) selectedFiles.add(name);
+    }
+    updateFileSelectionUI();
+  } else if (e.key === "Escape") {
+    selectedFiles.clear();
+    if (currentFile) selectedFiles.add(currentFile);
+    updateFileSelectionUI();
+  }
 });
 
 window.addEventListener("keydown", (e) => {
