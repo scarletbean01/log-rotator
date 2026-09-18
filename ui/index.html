@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>log-sidecar</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="layout">
+      <aside id="sidebar">
+        <h1>logs</h1>
+        <ul id="file-list"></ul>
+      </aside>
+      <div id="main">
+        <div id="toolbar">
+          <input id="query" placeholder="search… (Enter to run, Esc to cancel)" autocomplete="off" />
+          <label class="check"><input type="checkbox" id="regex" /> regex</label>
+          <select id="direction">
+            <option value="reverse">newest first</option>
+            <option value="forward">oldest first</option>
+          </select>
+          <label class="check"><input type="checkbox" id="follow" /> follow</label>
+          <span id="status"></span>
+        </div>
+        <div id="viewport">
+          <div id="sizer"><div id="content"></div></div>
+        </div>
+      </div>
+      <aside id="rail"></aside>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

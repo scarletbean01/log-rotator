@@ -1,0 +1,143 @@
+:root {
+  --bg: #10151c;
+  --panel: #171e28;
+  --border: #243040;
+  --fg: #d7e0ea;
+  --muted: #6b7a8c;
+  --accent: #4da3ff;
+  --mark-bg: #7a5b00;
+  --mark-fg: #ffe08a;
+  --rail-tick: #ffb454;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+#layout {
+  display: grid;
+  grid-template-columns: 200px 1fr 18px;
+  grid-template-rows: 100vh;
+  height: 100vh;
+}
+
+#sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 12px;
+  overflow-y: auto;
+}
+
+#sidebar h1 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+#file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#file-list li {
+  padding: 5px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#file-list li:hover { background: var(--border); }
+#file-list li.active { background: var(--accent); color: #08131f; }
+
+#main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+#toolbar #query {
+  flex: 1;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font: inherit;
+}
+
+#toolbar .check { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+#toolbar select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px;
+  font: inherit;
+}
+
+#status { color: var(--muted); margin-left: auto; }
+
+#viewport {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+  min-height: 0;
+}
+
+#sizer { position: relative; width: 100%; }
+#content { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+
+.row {
+  white-space: pre;
+  overflow: hidden;
+  padding: 0 12px;
+  color: var(--fg);
+}
+
+.row:hover { background: rgba(255, 255, 255, 0.03); }
+
+mark {
+  background: var(--mark-bg);
+  color: var(--mark-fg);
+  border-radius: 2px;
+}
+
+.regex-error { color: #ff7b7b; }
+
+#rail {
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  position: relative;
+}
+
+#rail .tick {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  height: 3px;
+  background: var(--rail-tick);
+  border-radius: 1px;
+  cursor: pointer;
+}

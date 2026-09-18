@@ -1,0 +1,306 @@
+//! File identity and reverse-seek tail reading.
+//!
+//! Pure `std`, no tokio. Reverse tail reads a fixed number of trailing lines
+//! from a file without loading the whole file: it scans backward in bounded
+//! chunks, counting newlines with SIMD-accelerated `memchr::memrchr`.
+
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::{FileExt, MetadataExt};
+use std::path::Path;
+
+use memchr::memrchr;
+
+/// Stable identity of an open file or a path (device + inode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileId {
+    pub fn of_path(path: &Path) -> io::Result<Self> {
+        let md = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: md.dev(),
+            ino: md.ino(),
+        })
+    }
+
+    pub fn of_file(file: &File) -> io::Result<Self> {
+        let md = file.metadata()?;
+        Ok(Self {
+            dev: md.dev(),
+            ino: md.ino(),
+        })
+    }
+}
+
+/// The last N lines of a file plus the byte range they occupy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailWindow {
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub lines: Vec<String>,
+}
+
+/// Read the last `lines` lines of `path` (byte-offset-accurate window).
+///
+/// Opens with `O_RDONLY` and no advisory locks, so concurrent writers are
+/// never blocked. Memory usage is bounded by the window size, not file size.
+pub fn read_tail(path: &Path, lines: usize, chunk_size: usize) -> io::Result<TailWindow> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+
+    if size == 0 || lines == 0 {
+        return Ok(TailWindow {
+            start_offset: 0,
+            end_offset: size,
+            lines: Vec::new(),
+        });
+    }
+
+    // Does the file end with a newline? Determines whether the final segment
+    // is a terminated line (no trailing empty line) or not.
+    let mut last = [0u8; 1];
+    file.read_exact_at(&mut last, size - 1)?;
+    let ends_nl = last[0] == b'\n';
+
+    // To expose the last `lines` lines we stop after counting this many
+    // newlines backward (one extra when the file ends in '\n', because that
+    // final newline terminates the last line rather than starting a new one).
+    let target = lines + usize::from(ends_nl);
+
+    let mut newline_count = 0usize;
+    let mut pos = size;
+    let mut start = 0u64;
+    let mut found = false;
+    let mut chunk = vec![0u8; chunk_size];
+
+    'outer: while pos > 0 {
+        let read_start = pos.saturating_sub(chunk_size as u64);
+        let read_len = (pos - read_start) as usize;
+        file.read_exact_at(&mut chunk[..read_len], read_start)?;
+
+        let mut sub = &chunk[..read_len];
+        while let Some(i) = memrchr(b'\n', sub) {
+            newline_count += 1;
+            if newline_count == target {
+                start = read_start + i as u64 + 1;
+                found = true;
+                break 'outer;
+            }
+            sub = &sub[..i];
+        }
+
+        pos = read_start;
+    }
+
+    // `found` is false only when the file has fewer than `target` newlines,
+    // i.e. fewer than `lines` lines; in that case the whole file is the tail.
+    if !found {
+        start = 0;
+    }
+
+    // Cap the window in bytes: a file with fewer (or pathologicaly long)
+    // lines must never turn into a whole-file read. The first line of a
+    // capped window may be partial (`tail -c` semantics).
+    let floor = size.saturating_sub(crate::limits::MAX_TAIL_WINDOW_BYTES);
+    if start < floor {
+        start = floor;
+    }
+
+    let bytes = read_range(&file, start, size)?;
+    let decoded = String::from_utf8_lossy(&bytes);
+    let mut out: Vec<String> = decoded.split('\n').map(str::to_string).collect();
+    // Drop the empty segment produced by a trailing newline.
+    if out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+
+    Ok(TailWindow {
+        start_offset: start,
+        end_offset: size,
+        lines: out,
+    })
+}
+
+/// Read `[start, end)` into memory, tolerant of a short read at EOF.
+fn read_range(file: &File, start: u64, end: u64) -> io::Result<Vec<u8>> {
+    let len = (end - start) as usize;
+    let mut buf = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        let n = file.read_at(&mut buf[filled..], start + filled as u64)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn write_file(path: &Path, content: &[u8]) {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        f.write_all(content).unwrap();
+    }
+
+    fn tail(path: &Path, lines: usize) -> TailWindow {
+        read_tail(path, lines, 64).unwrap()
+    }
+
+    #[test]
+    fn empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"");
+        let w = tail(&p, 10);
+        assert_eq!(w.lines, Vec::<String>::new());
+        assert_eq!(w.start_offset, 0);
+        assert_eq!(w.end_offset, 0);
+    }
+
+    #[test]
+    fn fewer_lines_than_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"one\ntwo\n");
+        let w = tail(&p, 10);
+        assert_eq!(w.lines, vec!["one", "two"]);
+        assert_eq!(w.start_offset, 0);
+    }
+
+    #[test]
+    fn exact_requested_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"a\nb\nc\nd\n");
+        let w = tail(&p, 2);
+        assert_eq!(w.lines, vec!["c", "d"]);
+        assert_eq!(w.start_offset, 4);
+        assert_eq!(w.end_offset, 8);
+    }
+
+    #[test]
+    fn no_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"a\nb\nc");
+        let w = tail(&p, 2);
+        assert_eq!(w.lines, vec!["b", "c"]);
+        assert_eq!(w.start_offset, 2);
+    }
+
+    #[test]
+    fn single_line_no_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"hello world");
+        let w = tail(&p, 5);
+        assert_eq!(w.lines, vec!["hello world"]);
+        assert_eq!(w.start_offset, 0);
+    }
+
+    #[test]
+    fn line_spanning_multiple_chunks() {
+        // 200 'A's = ~3.1 chunks of 64 bytes, one long line.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        let mut content = vec![b'A'; 200];
+        content.push(b'\n');
+        write_file(&p, &content);
+        let w = tail(&p, 1);
+        assert_eq!(w.lines.len(), 1);
+        assert_eq!(w.lines[0], "A".repeat(200));
+        assert_eq!(w.start_offset, 0);
+    }
+
+    #[test]
+    fn window_capped_for_single_huge_line() {
+        // One 6 MiB line with no newline: the window must be capped at
+        // MAX_TAIL_WINDOW_BYTES instead of reading the whole file.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        let content = vec![b'A'; 6 * 1024 * 1024];
+        write_file(&p, &content);
+        let w = tail(&p, 5);
+        assert_eq!(w.lines.len(), 1);
+        assert_eq!(
+            w.start_offset,
+            6 * 1024 * 1024 - crate::limits::MAX_TAIL_WINDOW_BYTES
+        );
+        assert_eq!(w.end_offset, 6 * 1024 * 1024);
+        assert!(w.end_offset - w.start_offset <= crate::limits::MAX_TAIL_WINDOW_BYTES);
+        assert_eq!(
+            w.lines[0].len(),
+            crate::limits::MAX_TAIL_WINDOW_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn chunk_boundary_newline() {
+        // A newline exactly at offset 64 (the first chunk boundary).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        let mut content = vec![b'x'; 64];
+        content.push(b'\n');
+        content.extend_from_slice(b"tail\n");
+        write_file(&p, &content);
+        let w = tail(&p, 1);
+        assert_eq!(w.lines, vec!["tail"]);
+        // start_offset = 65 (after the newline at offset 64)
+        assert_eq!(w.start_offset, 65);
+        assert_eq!(w.end_offset, 70);
+    }
+
+    #[test]
+    fn invalid_utf8_is_lossy() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        // Last line carries invalid UTF-8 bytes; must not panic, just lossy.
+        let content = vec![b'a', b'\n', 0xff, 0xfe];
+        write_file(&p, &content);
+        let w = tail(&p, 1);
+        assert_eq!(w.lines.len(), 1);
+        assert!(w.lines[0].contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn many_lines_scanned_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        let mut content = String::new();
+        for i in 0..1000 {
+            content.push_str(&format!("line {i:04}\n"));
+        }
+        write_file(&p, content.as_bytes());
+        let w = tail(&p, 3);
+        assert_eq!(w.lines, vec!["line 0997", "line 0998", "line 0999"]);
+        // start_offset points at the first byte of "line 0997".
+        let expected_start = (content.len() - "line 0997\nline 0998\nline 0999\n".len()) as u64;
+        assert_eq!(w.start_offset, expected_start);
+        assert_eq!(w.end_offset, content.len() as u64);
+    }
+
+    #[test]
+    fn empty_line_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"a\n\nb\n");
+        let w = tail(&p, 3);
+        assert_eq!(w.lines, vec!["a", "", "b"]);
+    }
+}

@@ -1,0 +1,26 @@
+# log-sidecar — systemd unit.
+#
+# Install to /etc/systemd/system/log-sidecar.service.
+#
+# NOTE: if /var/log/tomcat is group-restricted (e.g. the "tomcat" group), the
+# dynamic user below cannot read it. On such hosts either relax the log
+# directory permissions, or drop DynamicUser and use a static user with a
+# SupplementaryGroups= line. The exact group name is host-specific.
+
+[Unit]
+Description=log-sidecar — HTTP tail/grep/stream for Tomcat logs
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/log-sidecar --root /var/log/tomcat --bind 127.0.0.1 --port 9090
+DynamicUser=yes
+ReadOnlyPaths=/var/log/tomcat
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+MemoryMax=64M
+LimitNOFILE=1024
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

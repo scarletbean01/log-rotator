@@ -1,0 +1,4 @@
+[target.x86_64-unknown-linux-musl]
+linker = "zig-cc-musl"
+# zig cc provides the musl CRT + libc; rust's self-contained crt1.o would collide.
+rustflags = ["-C", "link-self-contained=no"]
