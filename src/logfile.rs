@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
-use memchr::memrchr;
+use memchr::{memchr, memrchr};
 
 /// Stable identity of an open file or a path (device + inode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,6 +42,7 @@ pub struct TailWindow {
     pub start_offset: u64,
     pub end_offset: u64,
     pub lines: Vec<String>,
+    pub anchor_line: Option<usize>,
 }
 
 /// Read the last `lines` lines of `path` (byte-offset-accurate window).
@@ -57,6 +58,7 @@ pub fn read_tail(path: &Path, lines: usize, chunk_size: usize) -> io::Result<Tai
             start_offset: 0,
             end_offset: size,
             lines: Vec::new(),
+            anchor_line: None,
         });
     }
 
@@ -122,7 +124,189 @@ pub fn read_tail(path: &Path, lines: usize, chunk_size: usize) -> io::Result<Tai
         start_offset: start,
         end_offset: size,
         lines: out,
+        anchor_line: None,
     })
+}
+
+/// Helper: scans backward from `from` down to `min_bound`, counting newlines.
+///
+/// Returns `(start_offset, count)`. If `target` newlines are found,
+/// `start_offset` is the byte immediately following the `target`-th newline.
+/// If `min_bound` is reached first, `start_offset` is `min_bound`.
+fn scan_newlines_backward(
+    file: &File,
+    from: u64,
+    min_bound: u64,
+    target: usize,
+    chunk_size: usize,
+) -> io::Result<(u64, usize)> {
+    if target == 0 || from <= min_bound {
+        return Ok((from, 0));
+    }
+    let mut pos = from;
+    let mut count = 0usize;
+    let mut chunk = vec![0u8; chunk_size];
+
+    while pos > min_bound {
+        let read_start = pos.saturating_sub(chunk_size as u64).max(min_bound);
+        let read_len = (pos - read_start) as usize;
+        if read_len == 0 {
+            break;
+        }
+        file.read_exact_at(&mut chunk[..read_len], read_start)?;
+        let mut sub = &chunk[..read_len];
+        while let Some(i) = memrchr(b'\n', sub) {
+            count += 1;
+            if count == target {
+                return Ok((read_start + i as u64 + 1, count));
+            }
+            sub = &sub[..i];
+        }
+        pos = read_start;
+    }
+
+    Ok((min_bound, count))
+}
+
+/// Read N lines centred on `anchor_offset` (the byte offset of a matched line).
+///
+/// Walks backward from `anchor_offset` to find the start of `lines / 2`
+/// preceding lines, then reads forward until `lines` total lines are collected.
+/// Memory is strictly bounded by `MAX_TAIL_WINDOW_BYTES` and `chunk_size`.
+pub fn read_around(
+    path: &Path,
+    anchor_offset: u64,
+    lines: usize,
+    chunk_size: usize,
+) -> io::Result<TailWindow> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if size == 0 || lines == 0 {
+        return Ok(TailWindow {
+            start_offset: 0,
+            end_offset: size,
+            lines: Vec::new(),
+            anchor_line: None,
+        });
+    }
+
+    let anchor = anchor_offset.min(size);
+    let before = lines / 2;
+    let min_start = anchor.saturating_sub(crate::limits::MAX_TAIL_WINDOW_BYTES / 2);
+    let chunk_size = chunk_size.max(1);
+
+    // 1. Walk backward from `anchor` to find `before` preceding lines.
+    // If before == 0 (e.g. lines == 1), target is 1 (the newline terminating the preceding line).
+    let (mut start, _) = scan_newlines_backward(&file, anchor, min_start, before + 1, chunk_size)?;
+
+    // 2. Read forward from `start` in a single pass up to MAX_TAIL_WINDOW_BYTES.
+    let max_forward = crate::limits::MAX_TAIL_WINDOW_BYTES.min(size.saturating_sub(start));
+    let mut bytes = read_range(&file, start, start + max_forward)?;
+
+    // Count newlines forward up to `lines`.
+    let mut newline_count = 0usize;
+    let mut actual_len = bytes.len();
+    let mut sub = &bytes[..];
+    let mut sub_offset = 0usize;
+
+    while let Some(i) = memchr(b'\n', sub) {
+        newline_count += 1;
+        if newline_count == lines {
+            actual_len = sub_offset + i + 1;
+            break;
+        }
+        sub_offset += i + 1;
+        sub = &sub[i + 1..];
+    }
+
+    if newline_count == lines {
+        bytes.truncate(actual_len);
+    } else if start + (bytes.len() as u64) == size && newline_count < lines && start > 0 {
+        // 3. Near EOF: backfill missing lines by expanding backward from `start`.
+        let missing = lines - newline_count;
+        let backfill_min = start.saturating_sub(
+            crate::limits::MAX_TAIL_WINDOW_BYTES.saturating_sub(bytes.len() as u64),
+        );
+        if backfill_min < start {
+            let (new_start, _) =
+                scan_newlines_backward(&file, start, backfill_min, missing + 1, chunk_size)?;
+            if new_start < start {
+                let prefix = read_range(&file, new_start, start)?;
+                let mut full = prefix;
+                full.extend_from_slice(&bytes);
+                bytes = full;
+                start = new_start;
+            }
+        }
+    } else if start + (bytes.len() as u64) < size {
+        // 4. Window hit MAX_TAIL_WINDOW_BYTES: trim trailing partial line if it doesn't end in '\n'.
+        if let Some(last_nl) = memrchr(b'\n', &bytes) {
+            let candidate_len = last_nl + 1;
+            if start + candidate_len as u64 >= anchor {
+                bytes.truncate(candidate_len);
+            }
+        }
+    }
+
+    let actual_end = start + bytes.len() as u64;
+    let decoded = String::from_utf8_lossy(&bytes);
+    let mut out: Vec<String> = decoded.split('\n').map(str::to_string).collect();
+    if out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+
+    // Determine the exact line index containing `anchor_offset` using raw byte offsets.
+    let mut anchor_line = None;
+    if !out.is_empty() && anchor_offset >= start {
+        let mut line_start = start;
+        let mut raw_slice = &bytes[..];
+        for (i, _) in out.iter().enumerate() {
+            let line_len = match memchr(b'\n', raw_slice) {
+                Some(nl) => nl + 1,
+                None => raw_slice.len(),
+            };
+            let line_end = line_start + line_len as u64;
+            if anchor_offset >= line_start
+                && (anchor_offset < line_end || (i + 1 == out.len() && anchor_offset <= line_end))
+            {
+                anchor_line = Some(i);
+                break;
+            }
+            line_start = line_end;
+            if line_len <= raw_slice.len() {
+                raw_slice = &raw_slice[line_len..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(TailWindow {
+        start_offset: start,
+        end_offset: actual_end,
+        lines: out,
+        anchor_line,
+    })
+}
+
+/// The index (0-based) of the line containing `anchor_offset` within a `TailWindow`.
+pub fn anchor_line_index(window: &TailWindow, anchor_offset: u64) -> usize {
+    if let Some(idx) = window.anchor_line {
+        return idx;
+    }
+    if window.lines.is_empty() {
+        return 0;
+    }
+    let encoder = |s: &str| s.len() as u64 + 1;
+    let mut off = window.start_offset;
+    for (i, line) in window.lines.iter().enumerate() {
+        let next = off + encoder(line);
+        if anchor_offset < next {
+            return i;
+        }
+        off = next;
+    }
+    window.lines.len().saturating_sub(1)
 }
 
 /// Read `[start, end)` into memory, tolerant of a short read at EOF.
@@ -302,5 +486,100 @@ mod tests {
         write_file(&p, b"a\n\nb\n");
         let w = tail(&p, 3);
         assert_eq!(w.lines, vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn read_around_centred() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("line {i:02}\n"));
+        }
+        write_file(&p, content.as_bytes());
+
+        // "line 05" starts at offset 5 * 8 = 40.
+        let w = read_around(&p, 40, 4, 16).unwrap();
+        assert_eq!(w.lines, vec!["line 03", "line 04", "line 05", "line 06"]);
+        let idx = anchor_line_index(&w, 40);
+        assert_eq!(idx, 2);
+        assert_eq!(w.lines[idx], "line 05");
+    }
+
+    #[test]
+    fn read_around_lines_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("line {i:02}\n"));
+        }
+        write_file(&p, content.as_bytes());
+
+        // "line 05" starts at offset 40. With lines=1, must return line 05, NOT line 00.
+        let w = read_around(&p, 40, 1, 16).unwrap();
+        assert_eq!(w.lines, vec!["line 05"]);
+        assert_eq!(anchor_line_index(&w, 40), 0);
+        assert_eq!(w.anchor_line, Some(0));
+
+        // Anchor in the middle of line 05 (offset 43)
+        let w_mid = read_around(&p, 43, 1, 16).unwrap();
+        assert_eq!(w_mid.lines, vec!["line 05"]);
+        assert_eq!(anchor_line_index(&w_mid, 43), 0);
+    }
+
+    #[test]
+    fn read_around_eof_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"line 00\nline 01\nline 02\n");
+
+        // Around line 00 (start of file): requesting 2 lines
+        let w_start = read_around(&p, 0, 2, 16).unwrap();
+        assert_eq!(w_start.lines, vec!["line 00", "line 01"]);
+        assert_eq!(anchor_line_index(&w_start, 0), 0);
+
+        // Around line 02 (end of file): requesting 3 lines.
+        // Must backfill line 00 so all 3 lines are returned!
+        let w_end = read_around(&p, 16, 3, 16).unwrap();
+        assert_eq!(w_end.lines, vec!["line 00", "line 01", "line 02"]);
+        assert_eq!(anchor_line_index(&w_end, 16), 2);
+    }
+
+    #[test]
+    fn read_around_lossy_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        // Line with invalid UTF-8 bytes before anchor line
+        let mut content = vec![b'a', b'\n', 0xff, 0xfe, b'\n'];
+        content.extend_from_slice(b"target line\n");
+        write_file(&p, &content);
+
+        // "target line" starts at offset 5.
+        let w = read_around(&p, 5, 3, 16).unwrap();
+        assert_eq!(w.lines.len(), 3);
+        assert_eq!(anchor_line_index(&w, 5), 2);
+        assert_eq!(w.lines[2], "target line");
+    }
+
+    #[test]
+    fn read_around_window_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        // 5 MiB of data before anchor line
+        let mut content = vec![b'x'; 5 * 1024 * 1024];
+        content.push(b'\n');
+        let anchor = content.len() as u64;
+        content.extend_from_slice(b"anchor line\n");
+        content.extend_from_slice(&vec![b'y'; 1024 * 1024]);
+        write_file(&p, &content);
+
+        let w = read_around(&p, anchor, 5, 64).unwrap();
+        // Window must be capped at MAX_TAIL_WINDOW_BYTES and contain anchor line
+        assert!(w.end_offset - w.start_offset <= crate::limits::MAX_TAIL_WINDOW_BYTES);
+        assert!(w.start_offset <= anchor);
+        assert!(w.end_offset >= anchor + "anchor line\n".len() as u64);
+        let idx = anchor_line_index(&w, anchor);
+        assert_eq!(w.lines[idx], "anchor line");
     }
 }

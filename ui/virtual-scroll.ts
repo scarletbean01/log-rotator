@@ -12,7 +12,7 @@ export interface LineSource {
 }
 
 export type RenderResult = { html: string; className?: string };
-export type RowRenderer = (text: string) => string | RenderResult;
+export type RowRenderer = (text: string, offset: number, index: number) => string | RenderResult;
 
 export class VirtualScroller {
   private viewport: HTMLElement;
@@ -56,6 +56,21 @@ export class VirtualScroller {
     this.viewport.scrollTop = Math.min(index * this.lineHeight, max);
   }
 
+  scrollToLineCentered(index: number): void {
+    const target = index * this.lineHeight - (this.viewport.clientHeight / 2) + (this.lineHeight / 2);
+    const max = Math.max(0, this.source.length() * this.lineHeight - this.viewport.clientHeight);
+    this.viewport.scrollTop = Math.min(Math.max(0, target), max);
+  }
+
+  setSourceCentered(source: LineSource, centerIndex: number): void {
+    this.source = source;
+    this.sizer.style.height = `${this.source.length() * this.lineHeight}px`;
+    const target = centerIndex * this.lineHeight - (this.viewport.clientHeight / 2) + (this.lineHeight / 2);
+    const max = Math.max(0, this.source.length() * this.lineHeight - this.viewport.clientHeight);
+    this.viewport.scrollTop = Math.min(Math.max(0, target), max);
+    this.render();
+  }
+
   scrollToTop(): void {
     this.viewport.scrollTop = 0;
   }
@@ -88,7 +103,8 @@ export class VirtualScroller {
       const row = document.createElement("div");
       row.style.height = `${this.lineHeight}px`;
       row.dataset.offset = String(d.offset);
-      const result = this.renderRow(d.text);
+      row.dataset.index = String(i);
+      const result = this.renderRow(d.text, d.offset, i);
       if (typeof result === "string") {
         row.className = "row";
         row.innerHTML = result;

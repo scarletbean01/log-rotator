@@ -22,11 +22,18 @@
             <option value="forward">oldest first</option>
           </select>
           <label class="check"><input type="checkbox" id="follow" /> follow</label>
+          <select id="tail-limit" aria-label="Lines to load">
+            <option value="500">500 lines</option>
+            <option value="1000">1 000 lines</option>
+            <option value="1500">1 500 lines</option>
+            <option value="2000">2 000 lines</option>
+          </select>
           <span id="match-nav">
             <button id="prev-match" title="Previous match (Shift+F3)">▲</button>
             <span id="match-pos"></span>
             <button id="next-match" title="Next match (F3)">▼</button>
           </span>
+          <button id="back-to-search" style="display: none;" title="Return to search results">← results</button>
           <button id="clear-search" title="Return to log view">✕ clear</button>
           <span id="status" role="status" aria-live="polite"></span>
         </div>

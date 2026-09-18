@@ -71,6 +71,7 @@ html, body {
 #toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 8px 12px;
   background: var(--panel);
@@ -143,6 +144,12 @@ html, body {
 .row-msg { flex: 1; }
 
 .row:hover { background: rgba(255, 255, 255, 0.03); }
+.row.grep-result { cursor: pointer; }
+.row.grep-result:hover { background: rgba(77, 163, 255, 0.14); }
+.row.row-anchor {
+  background: rgba(77, 163, 255, 0.2);
+  outline: 1px solid var(--accent);
+}
 
 mark {
   background: var(--mark-bg);

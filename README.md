@@ -78,13 +78,16 @@ Lists regular files in the root directory (non-recursive):
 { "files": [ { "name": "catalina.out", "size": 6888895, "modified_unix": 1789679490, "inode": 6275576 } ] }
 ```
 
-### `GET /api/tail?file=<name>&lines=500`
+### `GET /api/tail?file=<name>&lines=500&around_offset=`
 
-Returns the last `lines` (clamped 1..=5000) lines with byte offsets:
+Returns the last `lines` (clamped 1..=5000) lines with byte offsets, or a window
+of `lines` centred on `around_offset` (byte offset of an anchor line) if specified:
 
 ```json
-{ "file": "catalina.out", "start_offset": 100, "end_offset": 200, "lines": ["...", "..."] }
+{ "file": "catalina.out", "start_offset": 100, "end_offset": 200, "lines": ["...", "..."], "anchor_line": 2 }
 ```
+
+`anchor_line` is 0-based and present only when `around_offset` is provided.
 
 ### `GET /api/grep?file=<name>&query=<q>&is_regex=false&direction=reverse&from_offset=&limit=1000`
 

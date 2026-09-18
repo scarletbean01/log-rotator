@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -207,26 +207,56 @@ async fn handle_files(State(state): State<AppState>) -> Result<Json<serde_json::
 struct TailParams {
     file: String,
     lines: Option<usize>,
+    around_offset: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct TailResponse {
+    file: String,
+    start_offset: u64,
+    end_offset: u64,
+    lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor_line: Option<usize>,
 }
 
 async fn handle_tail(
     State(state): State<AppState>,
     Query(p): Query<TailParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<TailResponse>, AppError> {
     let path = pathguard::resolve_under_root(&state.root, &p.file)?;
     let lines = p.lines.unwrap_or(500).clamp(1, 5000);
     let chunk = state.chunk_size;
+
+    if let Some(anchor_offset) = p.around_offset {
+        let w = tokio::task::spawn_blocking(move || {
+            crate::logfile::read_around(&path, anchor_offset, lines, chunk)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map_err(AppError::from)?;
+        let anchor_line = crate::logfile::anchor_line_index(&w, anchor_offset);
+        return Ok(Json(TailResponse {
+            file: p.file,
+            start_offset: w.start_offset,
+            end_offset: w.end_offset,
+            lines: w.lines,
+            anchor_line: Some(anchor_line),
+        }));
+    }
+
     // Backward scan + window read is blocking I/O: keep it off the workers.
     let w = tokio::task::spawn_blocking(move || crate::logfile::read_tail(&path, lines, chunk))
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map_err(AppError::from)?;
-    Ok(Json(serde_json::json!({
-        "file": p.file,
-        "start_offset": w.start_offset,
-        "end_offset": w.end_offset,
-        "lines": w.lines,
-    })))
+    Ok(Json(TailResponse {
+        file: p.file,
+        start_offset: w.start_offset,
+        end_offset: w.end_offset,
+        lines: w.lines,
+        anchor_line: None,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +521,26 @@ mod tests {
         assert_eq!(lines[0], "line 100");
         assert_eq!(lines[1], "ERROR boom");
         assert!(v["start_offset"].as_u64().unwrap() < v["end_offset"].as_u64().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tail_around_offset_returns_centred_lines() {
+        let dir = setup_root();
+        let state = test_state(dir.path(), None, 2);
+        // "line 050" in catalina.out starts at 49 * 9 = 441.
+        let resp = request(
+            &state,
+            "/api/tail?file=catalina.out&lines=4&around_offset=441",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let lines = v["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 4);
+        let anchor_idx = v["anchor_line"].as_u64().unwrap() as usize;
+        assert_eq!(lines[anchor_idx], "line 050");
     }
 
     #[tokio::test(flavor = "multi_thread")]
