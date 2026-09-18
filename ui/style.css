@@ -102,19 +102,45 @@ html, body {
 #viewport {
   flex: 1;
   overflow-y: auto;
+  overflow-x: auto;
   position: relative;
   min-height: 0;
 }
 
 #sizer { position: relative; width: 100%; }
-#content { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+#content {
+  position: absolute;
+  top: 0;
+  left: 0;
+  min-width: 100%;
+  will-change: transform;
+}
 
 .row {
+  display: flex;
+  align-items: baseline;
   white-space: pre;
-  overflow: hidden;
-  padding: 0 12px;
+  padding: 0 12px 0 0;
   color: var(--fg);
+  min-width: max-content;
 }
+
+/* Timestamp gutter */
+.row-ts {
+  flex-shrink: 0;
+  width: 8ch;
+  padding: 0 6px 0 12px;
+  color: var(--muted);
+  user-select: none;
+  cursor: default;
+  border-right: 1px solid var(--border);
+  margin-right: 8px;
+  text-align: right;
+  opacity: 0.7;
+}
+
+/* Message body */
+.row-msg { flex: 1; }
 
 .row:hover { background: rgba(255, 255, 255, 0.03); }
 

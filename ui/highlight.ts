@@ -63,6 +63,44 @@ function collectMatches(text: string, query: string, isRegex: boolean): MatchRan
   return out;
 }
 
+// Timestamp parsing for the gutter column.
+// Matches the three most common Tomcat/Java log timestamp formats:
+//   2026-09-18T10:15:32(.481Z)  — ISO 8601
+//   2026-09-18 10:15:32(.481)   — space-separated datetime
+//   10:15:32(.481)              — bare time
+const TS_RE =
+  /^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)/;
+
+export interface ParsedTimestamp {
+  display: string;   // short label shown in gutter (HH:mm:ss)
+  full: string;      // full matched text for tooltip
+  date: Date | null; // parsed Date for relative calculation (null if bare time)
+  msgStart: number;  // index into line where the message body starts
+}
+
+export function parseTimestamp(line: string): ParsedTimestamp | null {
+  const m = TS_RE.exec(line);
+  if (!m) return null;
+  const raw = m[1];
+  const end = m[0].length;
+  // Skip any separating whitespace/brackets after the timestamp
+  let msgStart = end;
+  while (msgStart < line.length && (line[msgStart] === " " || line[msgStart] === "," || line[msgStart] === "[")) {
+    msgStart++;
+  }
+  // Extract HH:mm:ss for the gutter label
+  const timeMatch = /(\d{2}:\d{2}:\d{2})/.exec(raw);
+  const display = timeMatch ? timeMatch[1] : raw.slice(0, 8);
+  // Try to parse a full date; bare times (no date part) give null
+  let date: Date | null = null;
+  if (raw.length > 8) {
+    const normalized = raw.replace(" ", "T");
+    const d = new Date(normalized);
+    if (!isNaN(d.getTime())) date = d;
+  }
+  return { display, full: raw, date, msgStart };
+}
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")

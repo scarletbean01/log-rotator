@@ -1,5 +1,5 @@
 import { VirtualScroller, LineSource, LineData } from "./virtual-scroll";
-import { highlight, classifyLevel } from "./highlight";
+import { highlight, classifyLevel, parseTimestamp } from "./highlight";
 
 // ---- token handling --------------------------------------------------------
 // The token lives in sessionStorage; fetches send it as a header, SSE URLs
@@ -38,6 +38,15 @@ function humanSize(bytes: number): string {
 
 function relativeTime(unix: number): string {
   const delta = Math.floor(Date.now() / 1000) - unix;
+  if (delta < 5) return "just now";
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
+  return `${Math.floor(delta / 86400)}d ago`;
+}
+
+function relativeTs(date: Date): string {
+  const delta = Math.floor((Date.now() - date.getTime()) / 1000);
   if (delta < 5) return "just now";
   if (delta < 60) return `${delta}s ago`;
   if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
@@ -97,10 +106,27 @@ let currentMatchIndex = -1;
 let grepMode = false;
 
 const scroller = new VirtualScroller(viewportEl, buffer, (text) => {
-  const html = highlight(text, query, isRegex).html;
   const className = classifyLevel(text);
+  const ts = parseTimestamp(text);
+  let html: string;
+  if (ts) {
+    const msg = text.slice(ts.msgStart);
+    const msgHtml = highlight(msg, query, isRegex).html;
+    const tooltip = ts.date
+      ? `${ts.full} · ${relativeTs(ts.date)}`
+      : ts.full;
+    const tsHtml = `<span class="row-ts" title="${escHtml(tooltip)}">${escHtml(ts.display)}</span>`;
+    html = `${tsHtml}<span class="row-msg">${msgHtml}</span>`;
+  } else {
+    html = `<span class="row-msg">${highlight(text, query, isRegex).html}</span>`;
+  }
   return className ? { html, className } : html;
 });
+
+/** Minimal HTML attribute escaper for tooltip strings. */
+function escHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
 
 // ---- files -----------------------------------------------------------------
 
@@ -294,16 +320,34 @@ function clearSearch(): void {
   if (currentFile) void openFile(currentFile);
 }
 
-// ---- wiring ----------------------------------------------------------------
-
-queryEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") startGrep();
-});
 
 searchBtnEl.addEventListener("click", startGrep);
 clearSearchEl.addEventListener("click", clearSearch);
 prevMatchEl.addEventListener("click", prevMatch);
 nextMatchEl.addEventListener("click", nextMatch);
+
+// ---- search-as-you-type (tail view only) -----------------------------------
+// Debounce at 120 ms; re-renders the already-loaded buffer with live highlights.
+// Does not fire a server search — that still requires Enter / the 🔍 button.
+
+let liveHighlightTimer = 0;
+
+queryEl.addEventListener("input", () => {
+  if (grepMode) return; // don't interfere with grep result view
+  clearTimeout(liveHighlightTimer);
+  liveHighlightTimer = window.setTimeout(() => {
+    query = queryEl.value;
+    isRegex = regexEl.checked;
+    scroller.refresh();
+  }, 120);
+});
+
+queryEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    clearTimeout(liveHighlightTimer); // server search wins
+    startGrep();
+  }
+});
 
 followEl.addEventListener("change", () => {
   if (followEl.checked) startFollow();
