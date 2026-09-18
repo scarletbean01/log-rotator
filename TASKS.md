@@ -24,3 +24,12 @@
 - [x] 4.1 Static build x86_64-unknown-linux-musl (zig cross-link)
 - [x] 4.2 Resource verification (RSS < 15 MB under large-file grep)
 - [x] 4.3 systemd unit with resource constraints
+
+## Milestone 5: Review hardening
+- [x] 5.1 `config.rs`: IPv6-safe `socket_addr()` (no panic), `--chunk-size` bounds, `--max-streams`, non-empty unreserved-charset token validation
+- [x] 5.2 `limits.rs`: `MAX_LINE_BYTES` (1 MiB) / `MAX_TAIL_WINDOW_BYTES` (4 MiB) caps across grep/stream/tail
+- [x] 5.3 `grep.rs`: per-scan SIMD `Finder` (not per line), reused line buffers, oversized-line skip both directions
+- [x] 5.4 `http.rs`: `spawn_blocking` for tail + file list, typed sorted `FileEntry`, exact `truncated` (limit+1 probe), `direction` 400, `--max-streams` gate, zero-copy asset fallback, `Cache-Control`/`X-Accel-Buffering` on SSE, JSON 404 for `/api`
+- [x] 5.5 `watcher.rs`/`rotate.rs`: hoisted buffers, notify-error logging, high-water truncation detection
+- [x] 5.6 `error.rs`: `Internal` detail logged server-side, generic client message
+- [x] 5.7 `Cargo.toml`: `[profile.release]` strip/LTO/codegen-units; 58 tests (21 new)

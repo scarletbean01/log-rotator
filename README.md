@@ -16,8 +16,8 @@ binary.
 - **Embedded UI** — virtual-scrolled viewer, regex highlighting, match-density
   rail, no external assets or build-step dependencies at runtime.
 - **Hardened by default** — directory-traversal-proof path resolution,
-  optional bearer token, bounded concurrent searches, RSS ~5 MB regardless of
-  file size, systemd sandbox.
+  optional bearer token, bounded concurrent searches and streams, hard
+  line/window caps so RSS stays ~5 MB regardless of file size, systemd sandbox.
 
 ## Requirements
 
@@ -57,11 +57,12 @@ devenv shell -- cargo run -- --root ./testdata/logs
 | Flag | Default | Description |
 |---|---|---|
 | `--root <PATH>` | `/var/log/tomcat` | Directory containing the log files (served non-recursively). |
-| `--bind <IP>` | `127.0.0.1` | Listen address. Non-loopback requires `--allow-public`. |
+| `--bind <IP>` | `127.0.0.1` | Listen address (IPv4 or IPv6). Non-loopback requires `--allow-public`. |
 | `--port <PORT>` | `9090` | Listen port. |
-| `--token <TOKEN>` | — | Optional bearer token. When set, `/api/*` requires `Authorization: Bearer <token>` or `?token=<token>`. |
+| `--token <TOKEN>` | — | Optional bearer token. Non-empty, unreserved URL chars only (`A-Z a-z 0-9 _ . - ~`). When set, `/api/*` requires `Authorization: Bearer <token>` or `?token=<token>`. |
 | `--max-searches <N>` | `2` | Maximum concurrent grep searches (further requests get `429`). |
-| `--chunk-size <BYTES>` | `65536` | Read chunk size for tail/grep/stream. |
+| `--max-streams <N>` | `8` | Maximum concurrent live streams (further requests get `429`). |
+| `--chunk-size <BYTES>` | `65536` | Read chunk size for tail/grep/stream (validated `4096..=8388608`). |
 | `--allow-public` | off | Permit binding to `0.0.0.0`/`::` or any non-loopback address. |
 
 ## API
@@ -98,7 +99,8 @@ event: done
 data: {"matches":5,"scanned_bytes":6888895,"truncated":false}
 ```
 
-An invalid regex returns `400`.
+An invalid regex or `direction` value returns `400`. `truncated` is exact:
+it is `true` only when more matches exist past `limit`.
 
 ### `GET /api/stream?file=<name>&from_offset=`
 
@@ -108,8 +110,8 @@ Live follow over SSE. Emits `line`, `rotated`, and `truncated` events.
 ### Errors
 
 `4xx`/`5xx` responses are JSON: `{"error":"message"}`. `400` bad parameter or
-regex, `401` unauthorized, `403` path escape, `404` not found, `429` search
-limit, `500` internal.
+regex, `401` unauthorized, `403` path escape, `404` not found, `429` search or
+stream limit, `500` internal.
 
 ## Deployment
 
@@ -130,7 +132,7 @@ If `/var/log/tomcat` is group-restricted, add the appropriate
 ## Development
 
 - `devenv tasks run logsidecar:check` is the gate (fmt + clippy `-D warnings` +
-  37 tests).
+  58 tests).
 - `scripts/measure-rss.sh` documents the RSS guarantee (Linux-only; needs a
   large fixture).
 - Architecture, module map, and per-package conventions live in `AGENTS.md`
@@ -146,3 +148,8 @@ If `/var/log/tomcat` is group-restricted, add the appropriate
   never blocked.
 - Bounded mpsc channels provide backpressure and turn a client disconnect into
   worker cancellation.
+- Hard memory caps (`src/limits.rs`): lines > 1 MiB are skipped by grep/stream,
+  tail windows are capped at 4 MiB — keeps RSS bounded on a rotated `.gz` or a
+  multi-GiB line with no newline.
+- The bearer token is restricted to unreserved URL chars, so the
+  `Authorization` header and `?token=` arms can never disagree.
