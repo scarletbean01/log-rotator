@@ -235,13 +235,20 @@ async fn handle_tail(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .map_err(AppError::from)?;
-        let anchor_line = crate::logfile::anchor_line_index(&w, anchor_offset);
+        // `read_around` already computes the anchor index from raw byte
+        // offsets. Re-deriving it here drifted on lossy-UTF-8 windows and
+        // reported `Some(0)` for empty files.
+        let anchor_line = if w.lines.is_empty() {
+            None
+        } else {
+            w.anchor_line
+        };
         return Ok(Json(TailResponse {
             file: p.file,
             start_offset: w.start_offset,
             end_offset: w.end_offset,
             lines: w.lines,
-            anchor_line: Some(anchor_line),
+            anchor_line,
         }));
     }
 
@@ -541,6 +548,24 @@ mod tests {
         assert_eq!(lines.len(), 4);
         let anchor_idx = v["anchor_line"].as_u64().unwrap() as usize;
         assert_eq!(lines[anchor_idx], "line 050");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tail_around_offset_on_empty_file_omits_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.log"), "").unwrap();
+        let state = test_state(dir.path(), None, 2);
+        let resp = request(
+            &state,
+            "/api/tail?file=empty.log&lines=4&around_offset=0",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert!(v["lines"].as_array().unwrap().is_empty());
+        // No lines → no valid index: `anchor_line` must be absent, not 0.
+        assert!(v.get("anchor_line").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

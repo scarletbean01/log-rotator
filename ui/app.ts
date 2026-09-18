@@ -244,10 +244,14 @@ async function openFile(name: string): Promise<void> {
 
 // ---- follow ----------------------------------------------------------------
 
-function startFollow(): void {
+function startFollow(fromOffset?: number): void {
   if (!currentFile) return;
   closeActiveSource();
-  const es = new EventSource(sseUrl(`/api/stream?file=${encodeURIComponent(currentFile)}`));
+  // `fromOffset` replays from a byte offset (used when resuming follow after
+  // a search); omitted, the stream starts at the current EOF.
+  const params = new URLSearchParams({ file: currentFile });
+  if (fromOffset !== undefined) params.set("from_offset", String(fromOffset));
+  const es = new EventSource(sseUrl(`/api/stream?${params.toString()}`));
   activeSource = es;
   statusEl.textContent = "following…";
 
@@ -333,14 +337,14 @@ function startGrep(): void {
       buffer.push(d.offset, d.line);
       matches.push({ offset: d.offset, lineIndex });
       scroller.refresh();
-      renderRail();
+      appendRailTick(d.offset);
       matchPosEl.textContent = `${matches.length}`;
     } else {
       if (!grepBuffer) grepBuffer = new LineBuffer();
       const lineIndex = grepBuffer.length();
       grepBuffer.push(d.offset, d.line);
       matches.push({ offset: d.offset, lineIndex });
-      renderRail();
+      appendRailTick(d.offset);
       matchPosEl.textContent = `${currentMatchIndex >= 0 ? currentMatchIndex + 1 : 1}/${matches.length}`;
     }
   });
@@ -366,6 +370,9 @@ function startGrep(): void {
 
 async function showContextAround(anchorOffset: number): Promise<void> {
   if (!currentFile) return;
+  // Leaving grep view: release the server search permit instead of letting
+  // the abandoned SSE hold it (--max-searches) until the scan finishes.
+  closeActiveSource();
 
   if (grepMode) {
     grepBuffer = new LineBuffer();
@@ -450,36 +457,79 @@ function backToSearch(): void {
 
 // ---- match rail ------------------------------------------------------------
 
+function makeTick(offset: number, railHeight: number): HTMLDivElement {
+  const tick = document.createElement("div");
+  tick.className = "tick";
+  tick.dataset.offset = String(offset);
+  tick.style.top = `${Math.min(1, offset / fileSize) * railHeight}px`;
+  return tick;
+}
+
+function appendRailTick(offset: number): void {
+  if (fileSize === 0) return; // positioned once `done` reports the file size
+  railEl.appendChild(makeTick(offset, railEl.clientHeight));
+}
+
 function renderRail(): void {
   railEl.innerHTML = "";
   if (fileSize === 0 || matches.length === 0) return;
   const railHeight = railEl.clientHeight;
   for (const m of matches) {
-    const tick = document.createElement("div");
-    tick.className = "tick";
-    tick.style.top = `${Math.min(1, m.offset / fileSize) * railHeight}px`;
-    tick.addEventListener("click", () => {
-      if (grepMode) {
-        scroller.scrollToLine(m.lineIndex);
-      } else {
-        void showContextAround(m.offset);
-      }
-    });
-    railEl.appendChild(tick);
+    railEl.appendChild(makeTick(m.offset, railHeight));
   }
 }
+
+railEl.addEventListener("click", (e) => {
+  const tick = (e.target as HTMLElement).closest(".tick") as HTMLElement | null;
+  if (!tick) return;
+  const idx = matches.findIndex((m) => m.offset === Number(tick.dataset.offset));
+  if (idx >= 0) goToMatch(idx);
+});
 
 // ---- match navigation ------------------------------------------------------
 
 function goToMatch(index: number): void {
   if (matches.length === 0) return;
   currentMatchIndex = ((index % matches.length) + matches.length) % matches.length;
+  const m = matches[currentMatchIndex];
   if (grepMode) {
-    scroller.scrollToLine(matches[currentMatchIndex].lineIndex);
+    scroller.scrollToLine(m.lineIndex);
   } else {
-    void showContextAround(matches[currentMatchIndex].offset);
+    // Adjacent match already inside the context window? Scroll locally
+    // instead of clearing the buffer and refetching over HTTP.
+    const localIdx = bufferLineIndexForOffset(m.offset);
+    if (localIdx !== null) {
+      activeAnchorOffset = m.offset;
+      activeAnchorLineIndex = localIdx;
+      scroller.scrollToLineCentered(localIdx);
+      scroller.refresh(); // re-render even if scrollTop did not change
+    } else {
+      void showContextAround(m.offset);
+    }
   }
   matchPosEl.textContent = `${currentMatchIndex + 1}/${matches.length}`;
+}
+
+/** Index of the buffer line starting at `offset`, or null if not loaded. */
+function bufferLineIndexForOffset(offset: number): number | null {
+  let lo = 0;
+  let hi = buffer.length() - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const o = buffer.get(mid).offset;
+    if (o === offset) return mid;
+    if (o < offset) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return null;
+}
+
+/** Byte offset just past the last buffered line (including its terminator). */
+function bufferEndOffset(): number | null {
+  const n = buffer.length();
+  if (n === 0) return null;
+  const last = buffer.get(n - 1);
+  return last.offset + new TextEncoder().encode(last.text).length + 1;
 }
 
 function nextMatch(): void { goToMatch(currentMatchIndex + 1); }
@@ -516,7 +566,9 @@ function clearSearch(): void {
     statusEl.textContent = `${currentFile} — ${buffer.length()} lines`;
     if (saved.wasFollow) {
       followEl.checked = true;
-      startFollow();
+      // Resume from the end of the restored buffer so lines written while
+      // the search was open are not skipped.
+      startFollow(bufferEndOffset() ?? undefined);
     }
   } else if (currentFile) {
     preSearchState = null;
@@ -571,6 +623,9 @@ followEl.addEventListener("change", () => {
 });
 
 tailLimitEl.addEventListener("change", () => {
+  // The pre-search snapshot was taken at the old limit; restoring it would
+  // desync the buffer/status from the dropdown. Drop it so ✕ clear refetches.
+  preSearchState = null;
   if (activeAnchorOffset !== null && currentFile) {
     void showContextAround(activeAnchorOffset);
   } else if (currentFile && !grepMode) {

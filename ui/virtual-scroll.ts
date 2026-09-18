@@ -22,6 +22,7 @@ export class VirtualScroller {
   private renderRow: RowRenderer;
   private lineHeight = 16;
   private overscan = 20;
+  private suppressScrollRender = false;
 
   constructor(viewport: HTMLElement, source: LineSource, renderRow: RowRenderer) {
     this.viewport = viewport;
@@ -37,7 +38,13 @@ export class VirtualScroller {
     viewport.appendChild(this.sizer);
 
     this.lineHeight = measureLineHeight();
-    this.viewport.addEventListener("scroll", () => this.render());
+    this.viewport.addEventListener("scroll", () => {
+      if (this.suppressScrollRender) {
+        this.suppressScrollRender = false;
+        return;
+      }
+      this.render();
+    });
   }
 
   setSource(source: LineSource): void {
@@ -67,8 +74,15 @@ export class VirtualScroller {
     this.sizer.style.height = `${this.source.length() * this.lineHeight}px`;
     const target = centerIndex * this.lineHeight - (this.viewport.clientHeight / 2) + (this.lineHeight / 2);
     const max = Math.max(0, this.source.length() * this.lineHeight - this.viewport.clientHeight);
-    this.viewport.scrollTop = Math.min(Math.max(0, target), max);
+    this.setScrollTop(Math.min(Math.max(0, target), max));
     this.render();
+  }
+
+  /** Set scrollTop while suppressing the scroll listener's redundant render. */
+  private setScrollTop(top: number): void {
+    const prev = this.viewport.scrollTop;
+    this.viewport.scrollTop = top;
+    if (this.viewport.scrollTop !== prev) this.suppressScrollRender = true;
   }
 
   scrollToTop(): void {

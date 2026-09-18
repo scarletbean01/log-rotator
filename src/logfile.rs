@@ -199,46 +199,64 @@ pub fn read_around(
     // If before == 0 (e.g. lines == 1), target is 1 (the newline terminating the preceding line).
     let (mut start, _) = scan_newlines_backward(&file, anchor, min_start, before + 1, chunk_size)?;
 
-    // 2. Read forward from `start` in a single pass up to MAX_TAIL_WINDOW_BYTES.
-    let max_forward = crate::limits::MAX_TAIL_WINDOW_BYTES.min(size.saturating_sub(start));
-    let mut bytes = read_range(&file, start, start + max_forward)?;
-
-    // Count newlines forward up to `lines`.
+    // 2. Read forward from `start` in bounded `chunk_size` steps until `lines`
+    //    newlines are collected, EOF is reached, or the window cap is hit.
+    //    Memory scales with the actual window, never MAX_TAIL_WINDOW_BYTES.
+    let mut bytes: Vec<u8> = Vec::new();
     let mut newline_count = 0usize;
-    let mut actual_len = bytes.len();
-    let mut sub = &bytes[..];
-    let mut sub_offset = 0usize;
-
-    while let Some(i) = memchr(b'\n', sub) {
-        newline_count += 1;
-        if newline_count == lines {
-            actual_len = sub_offset + i + 1;
-            break;
+    let mut pos = start;
+    let window_end = start
+        .saturating_add(crate::limits::MAX_TAIL_WINDOW_BYTES)
+        .min(size);
+    while pos < window_end && newline_count < lines {
+        let end = (pos + chunk_size as u64).min(window_end);
+        let chunk = read_range(&file, pos, end)?;
+        if chunk.is_empty() {
+            break; // file shrank mid-read; treat whatever we have as the window
         }
-        sub_offset += i + 1;
-        sub = &sub[i + 1..];
+        let mut consumed = chunk.len();
+        let mut sub = &chunk[..];
+        let mut sub_offset = 0usize;
+        while let Some(i) = memchr(b'\n', sub) {
+            newline_count += 1;
+            if newline_count == lines {
+                consumed = sub_offset + i + 1;
+                break;
+            }
+            sub_offset += i + 1;
+            sub = &sub[i + 1..];
+        }
+        bytes.extend_from_slice(&chunk[..consumed]);
+        pos += consumed as u64;
     }
 
-    if newline_count == lines {
-        bytes.truncate(actual_len);
-    } else if start + (bytes.len() as u64) == size && newline_count < lines && start > 0 {
+    // An unterminated final line at EOF still counts as a line.
+    let ends_with_nl = bytes.last() == Some(&b'\n');
+    let effective_lines = newline_count + usize::from(!ends_with_nl && !bytes.is_empty());
+
+    if newline_count < lines && pos >= size && start > 0 {
         // 3. Near EOF: backfill missing lines by expanding backward from `start`.
-        let missing = lines - newline_count;
-        let backfill_min = start.saturating_sub(
-            crate::limits::MAX_TAIL_WINDOW_BYTES.saturating_sub(bytes.len() as u64),
-        );
-        if backfill_min < start {
-            let (new_start, _) =
-                scan_newlines_backward(&file, start, backfill_min, missing + 1, chunk_size)?;
-            if new_start < start {
-                let prefix = read_range(&file, new_start, start)?;
-                let mut full = prefix;
-                full.extend_from_slice(&bytes);
-                bytes = full;
-                start = new_start;
+        let missing = lines.saturating_sub(effective_lines);
+        if missing > 0 {
+            let backfill_min = start.saturating_sub(
+                crate::limits::MAX_TAIL_WINDOW_BYTES.saturating_sub(bytes.len() as u64),
+            );
+            if backfill_min < start {
+                // `start` sits right after a newline; the 1st newline found
+                // backward is that one, so target `missing + 1` yields
+                // exactly `missing` additional lines.
+                let (new_start, _) =
+                    scan_newlines_backward(&file, start, backfill_min, missing + 1, chunk_size)?;
+                if new_start < start {
+                    let prefix = read_range(&file, new_start, start)?;
+                    let mut full = prefix;
+                    full.extend_from_slice(&bytes);
+                    bytes = full;
+                    start = new_start;
+                }
             }
         }
-    } else if start + (bytes.len() as u64) < size {
+    } else if newline_count < lines && pos < size {
         // 4. Window hit MAX_TAIL_WINDOW_BYTES: trim trailing partial line if it doesn't end in '\n'.
         if let Some(last_nl) = memrchr(b'\n', &bytes) {
             let candidate_len = last_nl + 1;
@@ -287,26 +305,6 @@ pub fn read_around(
         lines: out,
         anchor_line,
     })
-}
-
-/// The index (0-based) of the line containing `anchor_offset` within a `TailWindow`.
-pub fn anchor_line_index(window: &TailWindow, anchor_offset: u64) -> usize {
-    if let Some(idx) = window.anchor_line {
-        return idx;
-    }
-    if window.lines.is_empty() {
-        return 0;
-    }
-    let encoder = |s: &str| s.len() as u64 + 1;
-    let mut off = window.start_offset;
-    for (i, line) in window.lines.iter().enumerate() {
-        let next = off + encoder(line);
-        if anchor_offset < next {
-            return i;
-        }
-        off = next;
-    }
-    window.lines.len().saturating_sub(1)
 }
 
 /// Read `[start, end)` into memory, tolerant of a short read at EOF.
@@ -501,9 +499,8 @@ mod tests {
         // "line 05" starts at offset 5 * 8 = 40.
         let w = read_around(&p, 40, 4, 16).unwrap();
         assert_eq!(w.lines, vec!["line 03", "line 04", "line 05", "line 06"]);
-        let idx = anchor_line_index(&w, 40);
-        assert_eq!(idx, 2);
-        assert_eq!(w.lines[idx], "line 05");
+        assert_eq!(w.anchor_line, Some(2));
+        assert_eq!(w.lines[2], "line 05");
     }
 
     #[test]
@@ -519,13 +516,12 @@ mod tests {
         // "line 05" starts at offset 40. With lines=1, must return line 05, NOT line 00.
         let w = read_around(&p, 40, 1, 16).unwrap();
         assert_eq!(w.lines, vec!["line 05"]);
-        assert_eq!(anchor_line_index(&w, 40), 0);
         assert_eq!(w.anchor_line, Some(0));
 
         // Anchor in the middle of line 05 (offset 43)
         let w_mid = read_around(&p, 43, 1, 16).unwrap();
         assert_eq!(w_mid.lines, vec!["line 05"]);
-        assert_eq!(anchor_line_index(&w_mid, 43), 0);
+        assert_eq!(w_mid.anchor_line, Some(0));
     }
 
     #[test]
@@ -537,13 +533,13 @@ mod tests {
         // Around line 00 (start of file): requesting 2 lines
         let w_start = read_around(&p, 0, 2, 16).unwrap();
         assert_eq!(w_start.lines, vec!["line 00", "line 01"]);
-        assert_eq!(anchor_line_index(&w_start, 0), 0);
+        assert_eq!(w_start.anchor_line, Some(0));
 
         // Around line 02 (end of file): requesting 3 lines.
         // Must backfill line 00 so all 3 lines are returned!
         let w_end = read_around(&p, 16, 3, 16).unwrap();
         assert_eq!(w_end.lines, vec!["line 00", "line 01", "line 02"]);
-        assert_eq!(anchor_line_index(&w_end, 16), 2);
+        assert_eq!(w_end.anchor_line, Some(2));
     }
 
     #[test]
@@ -558,7 +554,7 @@ mod tests {
         // "target line" starts at offset 5.
         let w = read_around(&p, 5, 3, 16).unwrap();
         assert_eq!(w.lines.len(), 3);
-        assert_eq!(anchor_line_index(&w, 5), 2);
+        assert_eq!(w.anchor_line, Some(2));
         assert_eq!(w.lines[2], "target line");
     }
 
@@ -579,7 +575,41 @@ mod tests {
         assert!(w.end_offset - w.start_offset <= crate::limits::MAX_TAIL_WINDOW_BYTES);
         assert!(w.start_offset <= anchor);
         assert!(w.end_offset >= anchor + "anchor line\n".len() as u64);
-        let idx = anchor_line_index(&w, anchor);
-        assert_eq!(w.lines[idx], "anchor line");
+        let idx = w.lines.iter().position(|l| l == "anchor line").unwrap();
+        assert_eq!(w.anchor_line, Some(idx));
+    }
+
+    #[test]
+    fn read_around_unterminated_last_line_at_eof() {
+        // Actively written file: the last line has no trailing '\n'.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"line 00\nline 01\nline 02");
+
+        // "line 02" starts at offset 16. Requesting 2 lines must NOT
+        // over-backfill and return 3.
+        let w = read_around(&p, 16, 2, 16).unwrap();
+        assert_eq!(w.lines, vec!["line 01", "line 02"]);
+        assert_eq!(w.anchor_line, Some(1));
+
+        // lines=1: just the anchor line, no backfill at all.
+        let w1 = read_around(&p, 16, 1, 16).unwrap();
+        assert_eq!(w1.lines, vec!["line 02"]);
+        assert_eq!(w1.anchor_line, Some(0));
+    }
+
+    #[test]
+    fn read_around_eof_backfill_is_exact() {
+        // Terminated EOF: backfill must pull exactly the missing lines,
+        // never one extra.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        write_file(&p, b"pre\nline 00\nline 01\nline 02\n");
+
+        // "line 02" starts at offset 20; window covers line 01..line 02,
+        // backfill must add exactly line 00 — not "pre".
+        let w = read_around(&p, 20, 3, 16).unwrap();
+        assert_eq!(w.lines, vec!["line 00", "line 01", "line 02"]);
+        assert_eq!(w.anchor_line, Some(2));
     }
 }

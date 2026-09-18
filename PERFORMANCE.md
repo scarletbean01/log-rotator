@@ -1,170 +1,194 @@
 # Performance & Architectural Review Findings
 
-This document summarizes the performance, architecture, and correctness review conducted on the match context inspection and configurable tail limits implementation.
+This document summarizes the performance, architecture, and correctness review
+conducted on the match context inspection and configurable tail limits
+implementation, and records the resolution of each finding.
+
+**Status legend**: ✅ fixed · 🔧 fixed with adjustment (see notes) · ⚠️ accepted by design.
 
 ---
 
 ## 1. Performance Gaps & Memory Budget Constraints
 
-### 1.1 Unconditional 4 MiB Read in `read_around` Threatens the `< 15 MB` RSS Hard Constraint
-* **Location**: `src/logfile.rs:203-205`
+### 1.1 Unconditional 4 MiB Read in `read_around` Threatens the `< 15 MB` RSS Hard Constraint — ✅
+* **Location**: `src/logfile.rs` (`read_around`, forward-scan step)
 * **Severity**: High
 * **Hard Constraint**: `AGENTS.md` mandates daemon RSS `< 15 MB` under all conditions.
 * **Mechanism**:
-  When reading context around an anchor offset, `read_around` allocates and reads `MAX_TAIL_WINDOW_BYTES` (4 MiB) in a single pass:
-  ```rust
-  let max_forward = crate::limits::MAX_TAIL_WINDOW_BYTES.min(size.saturating_sub(start));
-  let mut bytes = read_range(&file, start, start + max_forward)?;
-  ```
-  Even when the client requests `lines = 500` (which typically consumes 30–60 KiB in standard log files) or `lines = 4`:
-  - A 4 MiB buffer is unconditionally read from disk and allocated on the heap.
-  - If near-EOF backfill triggers, `prefix` (up to 4 MiB) and `full` (reallocated to up to 4 MiB) exist concurrently, resulting in 8–12 MiB of raw byte buffers alone.
-  - After `String::from_utf8_lossy(&bytes)`, vector allocation for `lines: Vec<String>`, and JSON serialization in Axum, multiple concurrent requests or rapid match switching can easily breach the 15 MB RSS budget.
-* **Remediation**:
-  Scan forward in bounded `chunk_size` buffers (e.g. 64 KiB default) to locate the ending newline offset before allocating the window buffer, mirroring how `scan_newlines_backward` handles reverse scanning.
+  `read_around` allocated and read `MAX_TAIL_WINDOW_BYTES` (4 MiB) in a single
+  forward pass even when the client requested `lines = 500` (typically 30–60 KiB)
+  or `lines = 4`. Near-EOF backfill additionally held `prefix` (up to 4 MiB) and
+  `full` (reallocated, up to 4 MiB) concurrently with `bytes` — up to ~12 MiB of
+  transient raw buffers per request, on top of `String::from_utf8_lossy`,
+  `Vec<String>`, and JSON serialization. Multiple concurrent requests could
+  breach the 15 MB RSS budget.
+* **Resolution**:
+  The forward scan now proceeds in bounded `chunk_size` steps, extending a
+  single `bytes` buffer only until `lines` newlines are collected, EOF is
+  reached, or the window cap is hit. Peak allocation scales with the actual
+  window, never `MAX_TAIL_WINDOW_BYTES`. Verified: 50 consecutive context
+  requests against a 2.3 MB fixture leave daemon RSS flat (~12 MB debug build).
 
 ---
 
-### 1.2 $O(N^2)$ DOM Thrashing in Match Rail (`renderRail`)
-* **Location**: `ui/app.ts:336`, `ui/app.ts:343`, `ui/app.ts:453-470`
+### 1.2 $O(N^2)$ DOM Thrashing in Match Rail (`renderRail`) — ✅
+* **Location**: `ui/app.ts` (`renderRail`, grep `match` handler)
 * **Severity**: High (UI Responsiveness)
 * **Mechanism**:
-  `renderRail()` completely wipes `railEl.innerHTML = ""` and creates fresh DOM elements with individual inline `click` listeners for every match in `matches`:
-  ```ts
-  function renderRail(): void {
-    railEl.innerHTML = "";
-    if (fileSize === 0 || matches.length === 0) return;
-    const railHeight = railEl.clientHeight;
-    for (const m of matches) {
-      const tick = document.createElement("div");
-      ...
-      tick.addEventListener("click", () => { ... });
-      railEl.appendChild(tick);
-    }
-  }
-  ```
-  Because `renderRail()` is invoked on every single SSE `match` event:
-  For a search returning 1,000 matches (the default limit):
-  $$\sum_{k=1}^{1000} k = \frac{1000 \times 1001}{2} = 500,500 \text{ DOM elements and event listeners}$$
-  This creates massive garbage collection churn, main-thread blocking, and dropped frames while search results stream in.
-* **Remediation**:
-  1. Use event delegation by attaching a single click listener to `railEl` that calculates or reads `dataset.offset` from the clicked target.
-  2. Batch rail rendering via `requestAnimationFrame` or append ticks incrementally rather than wiping and rebuilding the rail on each match.
+  `renderRail()` wiped `railEl.innerHTML` and rebuilt every tick with its own
+  inline `click` listener on every SSE `match` event. For a 1,000-match search:
+  $$\sum_{k=1}^{1000} k = \frac{1000 \times 1001}{2} = 500{,}500 \text{ DOM elements and event listeners}$$
+* **Resolution**:
+  1. One delegated `click` listener on `railEl` resolves the clicked tick via
+     `dataset.offset` (stored on the tick element).
+  2. Ticks are appended incrementally (`appendRailTick`) as matches stream in;
+     a full rebuild (`renderRail`) happens only on resets (file open, new
+     search, clear) and when the `done` event finalizes `fileSize`.
 
 ---
 
-### 1.3 Redundant HTTP Requests During In-Window Match Navigation
-* **Location**: `ui/app.ts:474-486`
+### 1.3 Redundant HTTP Requests During In-Window Match Navigation — ✅
+* **Location**: `ui/app.ts` (`goToMatch`)
 * **Severity**: Medium
 * **Mechanism**:
-  When viewing context (`grepMode == false`), navigating between matches via F3, Shift+F3, `n`, `N`, or the ▲ / ▼ buttons invokes:
-  ```ts
-  function goToMatch(index: number): void {
-    ...
-    if (grepMode) {
-      scroller.scrollToLine(matches[currentMatchIndex].lineIndex);
-    } else {
-      void showContextAround(matches[currentMatchIndex].offset);
-    }
-  }
-  ```
-  Even if the adjacent match is only a few lines away and already rendered inside the active 500-line context window, `showContextAround` clears the buffer, fires an HTTP GET `/api/tail` round-trip, rebuilds the buffer, and resets scrolling. This introduces unnecessary network latency, server worker churn, and visual flashing.
-* **Remediation**:
-  Check if `matches[currentMatchIndex].offset` is already present within `buffer.get(0).offset` and `buffer.get(last).offset`. If present, update `activeAnchorLineIndex` and scroll locally using `scroller.scrollToLineCentered()`.
+  In context view, F3/`n`/`N`/▲/▼ always called `showContextAround`, clearing
+  the buffer, refetching `/api/tail`, and resetting scroll — even when the
+  adjacent match was already rendered inside the active context window.
+* **Resolution**:
+  `goToMatch` binary-searches the buffer for the match's byte offset
+  (`bufferLineIndexForOffset`); when present it scrolls locally
+  (`scrollToLineCentered`), moves the anchor highlight, and skips the network
+  round-trip. A miss (offset drift from lossy-UTF-8 or window edge) falls back
+  to the refetch.
 
 ---
 
-### 1.4 Dual Rendering in `VirtualScroller.setSourceCentered`
-* **Location**: `ui/virtual-scroll.ts:65-72`
+### 1.4 Dual Rendering in `VirtualScroller.setSourceCentered` — ✅
+* **Location**: `ui/virtual-scroll.ts`
 * **Severity**: Low
 * **Mechanism**:
-  In `VirtualScroller.setSourceCentered`:
-  ```ts
-  this.viewport.scrollTop = Math.min(Math.max(0, target), max);
-  this.render();
-  ```
-  Modifying `this.viewport.scrollTop` asynchronously or synchronously dispatches the browser `scroll` event, which triggers the registered listener `this.viewport.addEventListener("scroll", () => this.render())`. Calling `this.render()` directly immediately after results in redundant consecutive rendering cycles.
-* **Remediation**:
-  Avoid calling `this.render()` if setting `scrollTop` triggers the scroll listener, or suppress the listener during programmatically induced scroll updates.
+  Setting `viewport.scrollTop` dispatches a `scroll` event (asynchronously),
+  whose listener calls `render()`; `setSourceCentered` also called `render()`
+  directly, producing a redundant second render of ~60+ rows.
+* **Resolution**:
+  Programmatic `scrollTop` updates go through a private `setScrollTop` that
+  arms a `suppressScrollRender` flag only when the value actually changed; the
+  scroll listener consumes and clears the flag. The direct render remains for
+  the no-change case (where no event fires).
 
 ---
 
 ## 2. Correctness & Edge-Case Bugs
 
-### 2.1 Unterminated File at EOF Causes Line Count Mismatch and Over-Backfill
-* **Location**: `src/logfile.rs:207-240`
+### 2.1 Unterminated File at EOF Causes Line Count Mismatch and Over-Backfill — 🔧
+* **Location**: `src/logfile.rs` (`read_around`, EOF backfill branch)
 * **Severity**: High
 * **Mechanism**:
-  When counting forward to `lines`, `memchr(b'\n', sub)` counts newline characters. For an actively written log file where the final line lacks a trailing `\n`:
-  - `newline_count` is 1 less than the actual number of lines in `bytes`.
-  - When hitting EOF, `missing = lines - newline_count` calculates 1 extra line as "missing".
-  - Near-EOF backfill queries `scan_newlines_backward` for `missing + 1` newlines, pulling in an unnecessary extra line before `start`.
-  - Since `bytes` does not end in `\n`, `split('\n')` preserves the trailing unterminated line without popping.
-  - The function returns `lines + 1` lines (e.g. requesting `lines = 1` around an EOF line returns 2 lines).
-* **Remediation**:
-  Account for whether `bytes` ends with `\n` when determining effective line count at EOF:
+  For an actively written file whose final line lacks a trailing `\n`,
+  `newline_count` undercounted the real lines in `bytes` by one, so `missing`
+  was overestimated by one and the near-EOF backfill pulled an extra line;
+  the function returned `lines + 1` lines (e.g. `lines = 1` at EOF returned 2).
+* **Resolution** (adjustment to the original remediation):
+  The effective line count now accounts for the unterminated tail:
   ```rust
-  let ends_with_nl = bytes.ends_with(b"\n");
+  let ends_with_nl = bytes.last() == Some(&b'\n');
   let effective_lines = newline_count + usize::from(!ends_with_nl && !bytes.is_empty());
   let missing = lines.saturating_sub(effective_lines);
   ```
+  However, the backfill scan target **stays `missing + 1`**: `start` sits
+  immediately *after* a newline, so the 1st newline found backward is that
+  terminator itself; `target = missing + 1` yields exactly `missing` additional
+  lines. (Changing the target to `missing` — as first attempted — silently
+  disabled backfill for terminated files.) Regression tests cover both the
+  unterminated-EOF case and exact terminated-EOF backfill
+  (`read_around_unterminated_last_line_at_eof`,
+  `read_around_eof_backfill_is_exact`).
 
 ---
 
-### 2.2 Out-of-Bounds `anchor_line: 0` on Empty Files & Flawed Fallback
-* **Location**: `src/http.rs:238-245`, `src/logfile.rs:293-310`
+### 2.2 Out-of-Bounds `anchor_line: 0` on Empty Files & Flawed Fallback — 🔧
+* **Location**: `src/http.rs` (`handle_tail`), `src/logfile.rs`
 * **Severity**: Medium
 * **Mechanism**:
-  1. `read_around` accurately computes `anchor_line: Option<usize>` using raw byte offsets.
-  2. However, `handle_tail` overrides `w.anchor_line` with `anchor_line_index(&w, anchor_offset)`.
-  3. If the target file is empty (`size == 0`), `anchor_line_index` returns `0`, which `handle_tail` packages as `anchor_line: Some(0)`. The API returns `{"lines": [], "anchor_line": 0}`, advertising an invalid index into an empty array.
-  4. In `anchor_line_index`, the fallback logic computes byte lengths as `s.len() as u64 + 1`. If lines contain invalid UTF-8 (replaced with 3-byte `\u{FFFD}` sequences), multi-byte characters, or Windows CRLF line endings, the offset accumulator drifts, identifying the wrong anchor line.
-* **Remediation**:
-  Rely directly on `w.anchor_line` from `TailWindow` and serialize `anchor_line: None` when `w.lines` is empty.
+  1. `handle_tail` overrode `w.anchor_line` with `anchor_line_index(&w, …)`,
+     which returned `0` for empty windows — the API then advertised
+     `{"lines": [], "anchor_line": 0}`, an invalid index into an empty array.
+  2. The `anchor_line_index` fallback re-derived offsets from the decoded
+     `String` lines (`s.len() + 1`). **Correction to the original analysis**:
+     CRLF does *not* drift this encoder — `split('\n')` keeps the `\r` in the
+     line, so `s.len() + 1` equals the raw byte length. Multi-byte UTF-8 does
+     not drift either (UTF-8 `String::len` is byte length). Only lossy UTF-8
+     replacement (`\u{FFFD}`, 3 bytes per invalid sequence) drifts it.
+* **Resolution**:
+  `handle_tail` now serializes `w.anchor_line` from `read_around` directly and
+  `None` when `w.lines` is empty (field omitted via
+  `skip_serializing_if`). The `anchor_line_index` fallback was deleted —
+  `read_around` computes the anchor from raw byte offsets, which is always
+  more accurate than any re-derivation from decoded strings. Covered by
+  `tail_around_offset_on_empty_file_omits_anchor`.
 
 ---
 
 ## 3. Architectural, Concurrency & State Management Gaps
 
-### 3.1 Unclosed Grep EventSource Leaks Search Worker Permits on Context Jump
-* **Location**: `ui/app.ts:367-375`
+### 3.1 Unclosed Grep EventSource Holds Search Worker Permit on Context Jump — ✅
+* **Location**: `ui/app.ts` (`showContextAround`)
 * **Severity**: High
 * **Mechanism**:
-  When a user single-clicks a match row to view context, `showContextAround()` is called, setting `grepMode = false`. However, `closeActiveSource()` is **not** called.
-  - If grep was still streaming matches on a large file, the HTTP `/api/grep` connection remains active in the background.
-  - Because grep searches are strictly limited by `--max-searches` via `try_acquire_owned()` in `src/http.rs`, the semaphore permit remains held.
-  - New searches from other tabs or subsequent actions fail with HTTP 429 (`TooManyRequests`) until the abandoned search finishes.
-* **Remediation**:
-  Call `closeActiveSource()` inside `showContextAround()` to cleanly release the search permit when navigating away from search results.
+  Single-clicking a match row set `grepMode = false` without closing the grep
+  SSE connection. **Precision**: this is not a permanent leak — the permit is
+  released when the scan completes — but during a long scan on a large file the
+  `--max-searches` semaphore stays occupied, so new searches from other tabs
+  get HTTP 429 until the abandoned scan finishes. Wasted server work either
+  way.
+* **Resolution**:
+  `showContextAround` calls `closeActiveSource()` up front, releasing the
+  permit immediately. Tradeoff accepted: matches that would have streamed into
+  `grepBuffer` after navigation are no longer collected; "back to search"
+  shows what arrived before the jump.
 
 ---
 
-### 3.2 Follow Mode Stream Gap and Data Loss on Search Clear
-* **Location**: `ui/app.ts:508-521`
+### 3.2 Follow Mode Stream Gap and Data Loss on Search Clear — ✅
+* **Location**: `ui/app.ts` (`clearSearch`, `startFollow`)
 * **Severity**: Medium
 * **Mechanism**:
-  If `follow` was enabled prior to searching, `clearSearch()` restores `preSearchState` (snapshot from when search began) and calls `startFollow()`.
-  Because `startFollow()` initiates `/api/stream?file=...` without providing `from_offset`, the backend watcher begins streaming from the current file EOF at connection time.
-  Any log lines written to disk during the search session are skipped and never appended to the client buffer, creating a permanent gap in the log view.
-* **Remediation**:
-  When resuming follow on search clear, either supply `from_offset` pointing to the end of the restored buffer or fetch a fresh tail via `openFile(currentFile)`.
+  `clearSearch()` restored the pre-search buffer and re-entered follow via
+  `/api/stream` *without* `from_offset`, so the watcher started at the EOF at
+  reconnect time — every line written during the search session was skipped,
+  leaving a permanent gap.
+* **Resolution**:
+  `startFollow` accepts an optional `fromOffset`; `clearSearch` resumes from
+  `bufferEndOffset()` (byte offset just past the last restored line), so the
+  stream replays exactly the missed range. Explicit user follow toggles still
+  start at current EOF (no offset), which is correct for a fresh follow.
 
 ---
 
-### 3.3 Tail Limit Dropdown Desynchronization
-* **Location**: `ui/app.ts:508-525`, `ui/app.ts:573-585`
+### 3.3 Tail Limit Dropdown Desynchronization — ✅
+* **Location**: `ui/app.ts` (`tailLimitEl` change handler)
 * **Severity**: Low
 * **Mechanism**:
-  If the user changes `#tail-limit` to 2,000 lines while viewing context, and subsequently clicks "✕ clear", `clearSearch()` restores `preSearchState.lines` (which was cached at 500 lines). The UI dropdown indicates "2 000 lines", but the active buffer and status label show 500 lines.
-* **Remediation**:
-  Invalidate `preSearchState` or trigger a fresh `openFile(currentFile)` if the tail limit changed during search inspection.
+  `preSearchState` cached the buffer at the old limit; changing `#tail-limit`
+  during a search session and then clearing restored the stale window while the
+  dropdown (and status label) showed the new limit.
+* **Resolution**:
+  The `tail-limit` change handler now drops `preSearchState` unconditionally;
+  ✕ clear then falls through to `openFile(currentFile)`, refetching at the new
+  limit. (In plain tail view the snapshot is already `null`, so this is a
+  no-op there.)
 
 ---
 
-### 3.4 Single-Click Grep Row Navigation Interferes with Text Selection
-* **Location**: `ui/app.ts:587-598`
+### 3.4 Single-Click Grep Row Navigation Interferes with Text Selection — ⚠️
+* **Location**: `ui/app.ts` (viewport click handler)
 * **Severity**: Low (UX)
 * **Mechanism**:
-  Clicking anywhere on a row in grep mode triggers `showContextAround(offset)`. While double-clicks and non-empty selections are filtered out, a single click intended to focus the window or start a text drag immediately navigates away to context view, frustrating users attempting to select or copy log text.
-* **Remediation**:
-  Provide an explicit context action (e.g. double-click or a dedicated context icon/button) or verify mouse drag delta before triggering context switch.
+  Any single click on a grep row navigates to the context view.
+* **Decision — accepted by design, no change**:
+  The existing filters already cover the real conflict cases: clicks with
+  `e.detail > 1` (double-click word selection) are ignored, and clicks that
+  ended a drag with a non-empty selection are ignored. Single-click-to-context
+  is the core interaction of grep mode; moving it to double-click or a
+  dedicated button would slow the primary path to protect a case the
+  selection check already handles.
