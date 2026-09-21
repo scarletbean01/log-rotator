@@ -13,6 +13,7 @@ builds and reads from disk in debug builds (`#[folder = "ui/dist/"]` in `src/htt
 | `app.ts` | entry — file list, tail view, follow (`EventSource /api/stream`), grep (`EventSource /api/grep`), token handling, Esc cancel. |
 | `virtual-scroll.ts` | `VirtualScroller` windowing: measure line height once, render `[start, end)` with overscan, `translateY` positioning. |
 | `highlight.ts` | `highlight(text, query, isRegex)` → HTML with `<mark>`; invalid regex → inline error, never throws. |
+| `patterns.ts` | saved search patterns: localStorage-backed CRUD (`ls-patterns` key), per-browser persistence. |
 | `index.html` | layout skeleton: sidebar, toolbar, viewport, match rail. |
 | `style.css` | dark theme; layout grid + flex. |
 

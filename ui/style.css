@@ -297,3 +297,204 @@ mark {
   border-radius: 1px;
   cursor: pointer;
 }
+
+/* ---- Saved patterns picker ---- */
+
+.picker-wrapper {
+  position: relative;
+}
+
+.picker-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  min-width: 220px;
+  max-width: 360px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  margin-top: 4px;
+}
+
+.picker-dropdown.open {
+  display: block;
+}
+
+#pattern-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+}
+
+#pattern-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#pattern-list li:hover {
+  background: var(--border);
+}
+
+.pat-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pat-badge {
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.pat-empty {
+  color: var(--muted);
+  font-style: italic;
+  cursor: default !important;
+}
+
+.pat-empty:hover {
+  background: transparent !important;
+}
+
+.picker-footer {
+  border-top: 1px solid var(--border);
+  padding: 4px 8px;
+  text-align: right;
+}
+
+.picker-footer button {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 6px;
+}
+
+.picker-footer button:hover {
+  text-decoration: underline;
+}
+
+/* ---- Pattern manage dialog ---- */
+
+#pattern-dialog {
+  background: var(--panel);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  min-width: 340px;
+  max-width: 500px;
+  max-height: 70vh;
+  overflow-y: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+#pattern-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+#pattern-dialog h2 {
+  margin: 0 0 12px;
+  font-size: 15px;
+  color: var(--fg);
+}
+
+#dialog-pattern-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#dialog-pattern-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+#dialog-pattern-list li:last-child {
+  border-bottom: none;
+}
+
+.dialog-pat-name {
+  flex: 1;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--fg);
+  font: inherit;
+  padding: 2px 4px;
+  border-radius: 3px;
+  min-width: 0;
+}
+
+.dialog-pat-name:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.dialog-pat-query {
+  color: var(--muted);
+  font-size: 11px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.dialog-pat-del {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 4px;
+  flex-shrink: 0;
+}
+
+.dialog-pat-del:hover {
+  color: #ff7b7b;
+}
+
+.dialog-actions {
+  margin-top: 12px;
+  text-align: right;
+}
+
+.dialog-actions button {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.dialog-actions button:hover {
+  border-color: var(--accent);
+}
+
+/* Save button highlight when query is non-empty */
+#save-pattern.has-query {
+  color: var(--accent);
+  border-color: var(--accent);
+}

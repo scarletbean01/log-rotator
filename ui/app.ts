@@ -1,5 +1,6 @@
 import { VirtualScroller, LineSource, LineData } from "./virtual-scroll";
 import { highlight, classifyLevel, parseTimestamp } from "./highlight";
+import { loadPatterns, addPattern, removePattern, renamePattern, type SavedPattern } from "./patterns";
 
 // ---- token handling --------------------------------------------------------
 // The token lives in sessionStorage; fetches send it as a header, SSE URLs
@@ -107,6 +108,14 @@ const nextMatchEl = document.getElementById("next-match") as HTMLButtonElement;
 const clearSearchEl = document.getElementById("clear-search") as HTMLButtonElement;
 const backToSearchEl = document.getElementById("back-to-search") as HTMLButtonElement;
 const tailLimitEl = document.getElementById("tail-limit") as HTMLSelectElement;
+const savePatternEl = document.getElementById("save-pattern") as HTMLButtonElement;
+const patternBtnEl = document.getElementById("pattern-btn") as HTMLButtonElement;
+const patternDropdownEl = document.getElementById("pattern-dropdown") as HTMLElement;
+const patternListEl = document.getElementById("pattern-list") as HTMLUListElement;
+const managePatternsBtnEl = document.getElementById("manage-patterns") as HTMLButtonElement;
+const patternDialogEl = document.getElementById("pattern-dialog") as HTMLDialogElement;
+const dialogPatternListEl = document.getElementById("dialog-pattern-list") as HTMLUListElement;
+const closePatternsEl = document.getElementById("close-patterns") as HTMLButtonElement;
 
 // ---- state -----------------------------------------------------------------
 
@@ -694,6 +703,7 @@ function clearSearch(): void {
   query = "";
   isRegex = false;
   queryEl.value = "";
+  savePatternEl.classList.remove("has-query");
   matches = [];
   currentMatchIndex = -1;
   clearSearchEl.style.display = "none";
@@ -743,6 +753,7 @@ nextMatchEl.addEventListener("click", nextMatch);
 let liveHighlightTimer = 0;
 
 queryEl.addEventListener("input", () => {
+  savePatternEl.classList.toggle("has-query", queryEl.value.trim().length > 0);
   if (grepMode) return; // don't interfere with grep result view
   clearTimeout(liveHighlightTimer);
   liveHighlightTimer = window.setTimeout(() => {
@@ -756,7 +767,167 @@ queryEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     clearTimeout(liveHighlightTimer); // server search wins
     startGrep();
+  } else if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    e.preventDefault(); // suppress browser "save page"
+    saveCurrentPattern();
   }
+});
+
+// ---- saved patterns --------------------------------------------------------
+
+function renderPatternDropdown(): void {
+  const patterns = loadPatterns();
+  patternListEl.innerHTML = "";
+  if (patterns.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "pat-empty";
+    empty.textContent = "no saved patterns";
+    patternListEl.appendChild(empty);
+    return;
+  }
+  for (const p of patterns) {
+    const li = document.createElement("li");
+    li.dataset.id = p.id;
+    li.title = p.query;
+
+    const name = document.createElement("span");
+    name.className = "pat-name";
+    name.textContent = p.name;
+    li.appendChild(name);
+
+    if (p.isRegex) {
+      const badge = document.createElement("span");
+      badge.className = "pat-badge";
+      badge.textContent = "regex";
+      li.appendChild(badge);
+    }
+
+    li.addEventListener("click", () => {
+      queryEl.value = p.query;
+      regexEl.checked = p.isRegex;
+      savePatternEl.classList.toggle("has-query", true);
+      closePatternDropdown();
+      if (selectedFiles.size === 0 && !currentFile) {
+        statusEl.textContent = "select a file first";
+        return;
+      }
+      startGrep();
+    });
+
+    patternListEl.appendChild(li);
+  }
+}
+
+function openPatternDropdown(): void {
+  renderPatternDropdown();
+  patternDropdownEl.classList.add("open");
+}
+
+function closePatternDropdown(): void {
+  patternDropdownEl.classList.remove("open");
+}
+
+patternBtnEl.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (patternDropdownEl.classList.contains("open")) {
+    closePatternDropdown();
+  } else {
+    openPatternDropdown();
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!patternDropdownEl.contains(e.target as Node) &&
+      e.target !== patternBtnEl) {
+    closePatternDropdown();
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && patternDropdownEl.classList.contains("open")) {
+    e.stopPropagation();
+    e.preventDefault();
+    closePatternDropdown();
+  }
+});
+
+// ---- save pattern ----------------------------------------------------------
+
+function saveCurrentPattern(): void {
+  const q = queryEl.value.trim();
+  if (!q) {
+    statusEl.textContent = "type a query first";
+    return;
+  }
+  const name = window.prompt("Pattern name:", q.slice(0, 40));
+  if (name === null) return; // cancelled
+  const added = addPattern(q, regexEl.checked, name || undefined);
+  statusEl.textContent = added
+    ? `pattern saved: ${name || q.slice(0, 20)}`
+    : "pattern already exists";
+}
+
+savePatternEl.addEventListener("click", saveCurrentPattern);
+
+// ---- manage patterns dialog ------------------------------------------------
+
+function renderManageDialog(): void {
+  const patterns: SavedPattern[] = loadPatterns();
+  dialogPatternListEl.innerHTML = "";
+  if (patterns.length === 0) {
+    const li = document.createElement("li");
+    li.className = "pat-empty";
+    li.textContent = "No saved patterns.";
+    dialogPatternListEl.appendChild(li);
+    return;
+  }
+  for (const p of patterns) {
+    const li = document.createElement("li");
+
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.className = "dialog-pat-name";
+    nameInput.value = p.name;
+    nameInput.addEventListener("change", () => {
+      renamePattern(p.id, nameInput.value || p.query.slice(0, 40));
+    });
+    li.appendChild(nameInput);
+
+    const querySpan = document.createElement("span");
+    querySpan.className = "dialog-pat-query";
+    querySpan.textContent = p.query;
+    querySpan.title = p.query;
+    li.appendChild(querySpan);
+
+    if (p.isRegex) {
+      const badge = document.createElement("span");
+      badge.className = "pat-badge";
+      badge.textContent = "regex";
+      li.appendChild(badge);
+    }
+
+    const del = document.createElement("button");
+    del.className = "dialog-pat-del";
+    del.textContent = "✕";
+    del.title = "Delete pattern";
+    del.addEventListener("click", () => {
+      removePattern(p.id);
+      renderManageDialog(); // re-render
+    });
+    li.appendChild(del);
+
+    dialogPatternListEl.appendChild(li);
+  }
+}
+
+managePatternsBtnEl.addEventListener("click", () => {
+  closePatternDropdown();
+  renderManageDialog();
+  patternDialogEl.showModal();
+});
+
+closePatternsEl.addEventListener("click", () => {
+  patternDialogEl.close();
 });
 
 followEl.addEventListener("change", () => {
@@ -839,6 +1010,7 @@ document.getElementById("select-none-files")?.addEventListener("click", () => {
 
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (e.defaultPrevented) return;
     closeActiveSource();
     statusEl.textContent = "cancelled";
     return;

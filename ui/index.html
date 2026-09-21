@@ -22,6 +22,16 @@
         <div id="toolbar">
           <input id="query" placeholder="search… (Enter to run, Esc to cancel)" autocomplete="off" aria-label="Search query" />
           <button id="search-btn" title="Search (Enter)">🔍</button>
+          <button id="save-pattern" title="Save current search pattern (Ctrl+S)">★</button>
+          <div id="pattern-picker" class="picker-wrapper">
+            <button id="pattern-btn" title="Saved patterns">📋</button>
+            <div id="pattern-dropdown" class="picker-dropdown">
+              <ul id="pattern-list"></ul>
+              <div class="picker-footer">
+                <button id="manage-patterns">manage…</button>
+              </div>
+            </div>
+          </div>
           <label class="check"><input type="checkbox" id="regex" /> regex</label>
           <select id="direction" aria-label="Search direction">
             <option value="reverse">newest first</option>
@@ -49,6 +59,13 @@
       </div>
       <aside id="rail"></aside>
     </div>
+    <dialog id="pattern-dialog">
+      <h2>Saved Patterns</h2>
+      <ul id="dialog-pattern-list"></ul>
+      <div class="dialog-actions">
+        <button id="close-patterns">Close</button>
+      </div>
+    </dialog>
     <script type="module" src="/app.js"></script>
   </body>
 </html>
